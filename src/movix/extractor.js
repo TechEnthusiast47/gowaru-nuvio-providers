@@ -26,43 +26,6 @@ function originFromUrl(url) {
     }
 }
 
-function directHeadersFor(url, headers = {}) {
-    const origin = originFromUrl(url);
-    const referer = headers.Referer || headers.referer;
-    const out = { ...headers };
-
-    if (!referer || referer.includes('movix.cash')) {
-        out.Referer = `${origin}/`;
-    }
-
-    if (!out.Origin || String(out.Origin).includes('movix.cash')) {
-        out.Origin = origin;
-    }
-
-    if (!out['User-Agent'] && !out['user-agent']) {
-        out['User-Agent'] = USER_AGENT;
-    }
-
-    return out;
-}
-
-async function validateDirectUrl(url, headers = {}) {
-    try {
-        const res = await safeFetch(url, {
-            method: 'GET',
-            headers: {
-                ...directHeadersFor(url, headers),
-                Range: 'bytes=0-0'
-            },
-            redirect: 'follow'
-        });
-        if (!res) return false;
-        return res.status === 206 || (typeof res.status === 'number' && res.status >= 200 && res.status < 300);
-    } catch (e) {
-        return false;
-    }
-}
-
 function titleMatchesAny(candidateTitles, tmdbTitles) {
     if (!Array.isArray(candidateTitles) || candidateTitles.length === 0) return true;
     if (!Array.isArray(tmdbTitles) || tmdbTitles.length === 0) return true;
@@ -103,17 +66,13 @@ function normalizeLangTag(lang) {
 
 function pushStream(streams, provider, server, lang, url, quality) {
     if (!url || typeof url !== 'string') return;
+    const ref = originFromUrl(url) + '/';
     streams.push({
         name: 'Movix',
         title: `[${normalizeLangTag(lang)}] ${provider} - ${server || 'Player'}`,
-        server: `${provider} - ${server || 'Player'}`,
         url,
         quality: quality || 'HD',
-        headers: {
-            Origin: originFromUrl(url),
-            Referer: `${originFromUrl(url)}/`,
-            'User-Agent': USER_AGENT
-        }
+        headers: { Referer: ref }
     });
 }
 
@@ -189,17 +148,15 @@ async function resolveForExo(stream) {
     }
 
     if (!resolved || !resolved.url) return null;
-    if (!resolved.isDirect) return null; // Only accept truly direct links
+    if (!resolved.isDirect) return null;
 
-    const normalizedHeaders = directHeadersFor(resolved.url, resolved.headers || stream.headers);
-    if (!(await validateDirectUrl(resolved.url, normalizedHeaders))) return null;
-    
-    // Final validation: URL must look like a direct media link
     if (!isExoPlayableUrl(resolved.url)) return null;
 
     return {
         ...resolved,
-        headers: normalizedHeaders
+        headers: {
+            Referer: originFromUrl(resolved.url) + '/'
+        }
     };
 }
 
@@ -358,7 +315,8 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
         }
     }
 
-    const resolvedResults = await Promise.allSettled(unique.map((s) => resolveForExo(s)));
+    const toResolve = unique.slice(0, 4);
+    const resolvedResults = await Promise.allSettled(toResolve.map((s) => resolveForExo(s)));
     const playable = [];
     const seenPlayable = new Set();
     for (const r of resolvedResults) {
