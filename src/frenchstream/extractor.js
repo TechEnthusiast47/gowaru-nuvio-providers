@@ -202,11 +202,7 @@ function toStream(name, host, language, url) {
         title: `[${languageLabel(language)}] ${hostLabel(host)}`,
         url,
         quality: 'HD',
-        headers: {
-            Referer: `${origin}/`,
-            Origin: origin,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36'
-        }
+        headers: { Referer: `${origin}/` }
     };
 }
 
@@ -315,7 +311,8 @@ async function fetchFstreamApiFallback(tmdbId, mediaType, season, episode) {
 }
 
 async function resolveCandidates(candidates) {
-    const resolved = await Promise.allSettled(candidates.map((stream) => resolveStream(stream)));
+    const limited = candidates.slice(0, 4);
+    const resolved = await Promise.allSettled(limited.map((stream) => resolveStream(stream)));
     const direct = [];
     for (const result of resolved) {
         if (result.status !== 'fulfilled') continue;
