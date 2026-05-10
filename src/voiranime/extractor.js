@@ -23,6 +23,11 @@ function toSlug(title) {
     .replace(/^-|-$/g, "");
 }
 
+const ROMAN_MAP = { 2: "ii", 3: "iii", 4: "iv", 5: "v", 6: "vi", 7: "vii", 8: "viii" };
+function toRoman(n) {
+  return ROMAN_MAP[n] || "";
+}
+
 /**
  * Extract the base slug from a VoirAnime URL (strips season/vf suffixes)
  * e.g. ".../shingeki-no-kyojin-3-vf/" -> "shingeki-no-kyojin"
@@ -72,16 +77,22 @@ async function searchAnime(title, season = 1) {
       `${baseSlug}-1-vf`,
     );
   } else {
-    // For later seasons try numbered variants first
+    const romanSuffix = toRoman(season);
     slugCandidates.push(
       `${baseSlug}-${season}`,
       `${baseSlug}-${season}-vostfr`,
       `${baseSlug}-${season}-vf`,
       `${baseSlug}-saison-${season}`,
       `${baseSlug}-the-final-season`, // common S4 alias
-      baseSlug,
-      baseSlugNoThe,
     );
+    if (romanSuffix) {
+      slugCandidates.push(
+        `${baseSlug}-${romanSuffix}`,
+        `${baseSlug}-${romanSuffix}-vostfr`,
+        `${baseSlug}-${romanSuffix}-vf`,
+      );
+    }
+    slugCandidates.push(baseSlug, baseSlugNoThe);
   }
   // Also try without 's
   const slugNoApost = toSlug(title.replace(/'s/gi, ""));
@@ -135,6 +146,7 @@ async function searchAnime(title, season = 1) {
       ...new Set(results.map((r) => extractBaseSlug(r.url)).filter(Boolean)),
     ];
     for (const bs of baseSlugsFromSearch) {
+      const romanSuffix = toRoman(season);
       const seasonSlugs =
         season === 1
           ? [bs, `${bs}-vf`, `${bs}-1`, `${bs}-1-vostfr`, `${bs}-1-vf`]
@@ -143,6 +155,7 @@ async function searchAnime(title, season = 1) {
               `${bs}-${season}-vostfr`,
               `${bs}-${season}-vf`,
               `${bs}-saison-${season}`,
+              ...(romanSuffix ? [`${bs}-${romanSuffix}`, `${bs}-${romanSuffix}-vostfr`, `${bs}-${romanSuffix}-vf`] : []),
             ];
       for (const sl of seasonSlugs) {
         const url = `${BASE_URL}/anime/${sl}/`;
@@ -298,7 +311,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
         'a[href*="/episode/"]',
         'a[href*="/ep/"]'
       ];
-      // First pass: try pattern matching on text/href
+      // First pass: try pattern matching on link text only (href may contain false positives like season numbers)
       for (const sel of epSelectors) {
         $(sel).each((i, el) => {
           if (episodeUrl) return false;
@@ -306,7 +319,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
           const href = $(el).attr("href");
           for (const pattern of epPatterns) {
             const regex = new RegExp(`(?:^|[^0-9])${pattern}(?:$|[^0-9])`, "i");
-            if (regex.test(text) || regex.test(href)) {
+            if (regex.test(text)) {
               episodeUrl = href;
               return false;
             }
@@ -334,6 +347,12 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
 
       if (!episodeUrl) continue;
 
+      // Verify the found episode actually belongs to the requested season
+      const epSaisonMatch = episodeUrl.match(/saison[_-](\d+)/i);
+      if (epSaisonMatch && parseInt(epSaisonMatch[1]) !== season) {
+        continue;
+      }
+
       const epRawHtml = await fetchText(episodeUrl);
       const ep$ = cheerio.load(epRawHtml);
 
@@ -342,8 +361,10 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
         const val = ep$(el).val();
         if (val && val !== "Choisir un lecteur") hosts.push(val);
       });
+      // Filter out hosts known to produce time-limited URLs unreliable in production
+      const filteredHosts = hosts.filter(h => !/YU|YourUpload/i.test(h));
 
-      if (hosts.length === 0) {
+      if (filteredHosts.length === 0) {
         // Catch any external iframe (not voiranime's own domain)
         let iframe = null;
         ep$("iframe").each((_, el) => {
@@ -359,12 +380,13 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
             title: `Default Player - ${lang}`,
             quality: "HD",
             url: iframe,
-            headers: { Referer: BASE_URL },
+            headers: { Referer: BASE_URL, Origin: BASE_URL, "User-Agent": "Mozilla/5.0" },
           });
           if (stream) streams.push(stream);
         }
       } else {
-        const hostPromises = hosts.map(async (host) => {
+        const streamHeaders = { Referer: BASE_URL, Origin: BASE_URL, "User-Agent": "Mozilla/5.0" };
+        const hostPromises = filteredHosts.map(async (host) => {
           try {
             const hostUrl = `${episodeUrl}${episodeUrl.includes("?") ? "&" : "?"}host=${encodeURIComponent(host)}`;
             const hostHtml = await fetchText(hostUrl);
@@ -387,7 +409,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
                 title: `${host} - ${lang}`,
                 url: embedUrl,
                 quality: "HD",
-                headers: { Referer: BASE_URL },
+                headers: { ...streamHeaders },
               });
             }
           } catch (err) {}

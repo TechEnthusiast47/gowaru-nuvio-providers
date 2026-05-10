@@ -2,20 +2,49 @@ import { fetchText, BASE } from './http.js';
 import { getTmdbTitles } from '../utils/metadata.js';
 import { resolveStream } from '../utils/resolvers.js';
 
-function unescapeJsString(str) {
-    return str
-        .replace(/\\"/g, '"')
-        .replace(/\\\\/g, '\\')
-        .replace(/\\\//g, '/')
-        .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+function extractPushContent(html) {
+    const chunks = [];
+    let pos = 0;
+    while (true) {
+        const start = html.indexOf('self.__next_f.push([1,"', pos);
+        if (start === -1) break;
+        const strStart = start + 'self.__next_f.push([1,"'.length;
+
+        let i = strStart;
+        let chunk = '';
+        let escaped = false;
+        while (i < html.length) {
+            const ch = html[i];
+            if (escaped) {
+                if (ch === 'n') chunk += '\n';
+                else if (ch === 't') chunk += '\t';
+                else if (ch === 'r') chunk += '\r';
+                else if (ch === '\\') chunk += '\\';
+                else if (ch === '"') chunk += '"';
+                else if (ch === '/') chunk += '/';
+                else if (ch === 'u') {
+                    const hex = html.substring(i + 1, i + 5);
+                    chunk += String.fromCharCode(parseInt(hex, 16));
+                    i += 4;
+                } else chunk += ch;
+                escaped = false;
+                i++;
+                continue;
+            }
+            if (ch === '\\') { escaped = true; i++; continue; }
+            if (ch === '"' && html.substring(i + 1, i + 3) === '])') break;
+            chunk += ch;
+            i++;
+        }
+
+        if (chunk) chunks.push(chunk);
+        pos = i + 1;
+    }
+    return chunks.join('');
 }
 
 function extractAnimeServerData(html) {
-    const pushRegex = /__next_f\.push\(\[1,"((?:\\.|[^"\\])*)"\]\)/g;
-    let allData = "";
-    for (const match of html.matchAll(pushRegex)) {
-        allData += unescapeJsString(match[1]);
-    }
+    const allData = extractPushContent(html);
 
     const marker = '"animeServer":';
     const idx = allData.indexOf(marker);
@@ -25,10 +54,17 @@ function extractAnimeServerData(html) {
     if (valueStart === -1) return null;
 
     let depth = 0;
+    let inStr = false;
+    let esc = false;
     let end = valueStart;
     for (let i = valueStart; i < allData.length; i++) {
-        if (allData[i] === '{') depth++;
-        else if (allData[i] === '}') {
+        const ch = allData[i];
+        if (esc) { esc = false; continue; }
+        if (ch === '\\' && inStr) { esc = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === '{') depth++;
+        else if (ch === '}') {
             depth--;
             if (depth === 0) { end = i + 1; break; }
         }
@@ -273,44 +309,86 @@ async function findSlug(titles) {
     return null;
 }
 
+function collectStreamsForLang(saison, lang, episodeIndex, seasonName) {
+    const episodeUrls = extractEpisodeUrls(saison, lang);
+    if (episodeIndex < 0 || episodeIndex >= episodeUrls.length) return [];
+
+    const sourceUrls = episodeUrls[episodeIndex];
+    const langLabel = lang === 'vf' ? 'VF' : 'VOSTFR';
+    return collectSourceUrls(sourceUrls).map(s => {
+        const label = s.sourceIndex < SOURCE_LABELS.length ? SOURCE_LABELS[s.sourceIndex] : `Source ${s.sourceIndex + 1}`;
+        return buildStreamEntry(s.url, label, langLabel, seasonName);
+    });
+}
+
+const slugCache = {};
+const animeDataCache = {};
+
+async function findCachedSlug(titles) {
+    for (const t of titles) {
+        if (slugCache[t]) return slugCache[t];
+    }
+    const slug = await findSlug(titles);
+    if (slug) {
+        for (const t of titles) {
+            if (!slugCache[t]) slugCache[t] = slug;
+        }
+    }
+    return slug;
+}
+
+async function getAnimeData(slug, mediaType) {
+    const cacheKey = slug + ':' + mediaType;
+    if (animeDataCache[cacheKey]) {
+        console.log(`[Mugiwara] Cache hit for ${cacheKey}`);
+        return animeDataCache[cacheKey];
+    }
+
+    const pageUrl = mediaType === 'movie'
+        ? `${BASE}/catalogue/${slug}/films`
+        : `${BASE}/catalogue/${slug}/episodes/saison1`;
+
+    let pageHtml;
+    try {
+        pageHtml = await fetchText(pageUrl);
+    } catch (e) {
+        if (mediaType !== 'movie') {
+            for (let s = 2; s <= 20; s++) {
+                try {
+                    pageHtml = await fetchText(`${BASE}/catalogue/${slug}/episodes/saison${s}`);
+                    break;
+                } catch (e2) {
+                    continue;
+                }
+            }
+        }
+    }
+
+    if (!pageHtml) {
+        console.log(`[Mugiwara] No page found for ${cacheKey}`);
+        return null;
+    }
+
+    const animeData = extractAnimeServerData(pageHtml);
+    if (animeData) {
+        animeDataCache[cacheKey] = animeData;
+    }
+    return animeData;
+}
+
 export async function extractStreams(tmdbId, mediaType, season, episodeNum) {
     const titles = await getTmdbTitles(tmdbId, mediaType);
     if (!titles || titles.length === 0) return [];
 
-    const slug = await findSlug(titles);
+    const slug = await findCachedSlug(titles);
     if (!slug) {
         console.log(`[Mugiwara] No anime found for tmdbId ${tmdbId}`);
         return [];
     }
 
-    console.log(`[Mugiwara] Found slug: ${slug}`);
-
-    let pageHtml = null;
-    if (mediaType === 'movie') {
-        try {
-            pageHtml = await fetchText(`${BASE}/catalogue/${slug}/films`);
-        } catch (e) {
-            console.log(`[Mugiwara] No films page for ${slug}`);
-            return [];
-        }
-    } else {
-        for (let s = 1; s <= 20; s++) {
-            try {
-                pageHtml = await fetchText(`${BASE}/catalogue/${slug}/episodes/saison${s}`);
-                break;
-            } catch (e) {
-                continue;
-            }
-        }
-        if (!pageHtml) {
-            console.log(`[Mugiwara] No valid season page found for ${slug}`);
-            return [];
-        }
-    }
-
-    const animeData = extractAnimeServerData(pageHtml);
+    const animeData = await getAnimeData(slug, mediaType);
     if (!animeData) {
-        console.log(`[Mugiwara] Could not extract anime data from page`);
+        console.log(`[Mugiwara] Could not extract anime data for ${slug}`);
         return [];
     }
 
@@ -331,7 +409,7 @@ export async function extractStreams(tmdbId, mediaType, season, episodeNum) {
     }
 
     const saisons = animeData.options.saisons;
-    const lang = 'vostfr';
+    const langs = ['vostfr', 'vf'];
 
     const matched = matchSaison(saisons, season, episodeNum);
     if (!matched) {
@@ -340,18 +418,33 @@ export async function extractStreams(tmdbId, mediaType, season, episodeNum) {
     }
 
     const { saison: matchedSaison, episodeIndex: epIndex } = matched;
-    const episodeUrls = extractEpisodeUrls(matchedSaison, lang);
-    if (epIndex < 0 || epIndex >= episodeUrls.length) {
-        console.log(`[Mugiwara] Episode ${episodeNum} out of range (${episodeUrls.length} eps)`);
-        return [];
+    const seasonName = matchedSaison.name || 'Saison ' + matchedSaison.id;
+
+    const seenUrls = new Set();
+    const allStreams = [];
+
+    for (const lang of langs) {
+        if (!matchedSaison.lang || !matchedSaison.lang[lang]) {
+            console.log(`[Mugiwara] No ${lang} data for ${seasonName}`);
+            continue;
+        }
+
+        const langEpCount = Math.max(...matchedSaison.lang[lang].map(arr => Array.isArray(arr) ? arr.length : 0));
+        if (epIndex >= langEpCount) {
+            console.log(`[Mugiwara] ${lang} only has ${langEpCount} episodes, S${season}E${episodeNum} out of range`);
+            continue;
+        }
+
+        const streams = collectStreamsForLang(matchedSaison, lang, epIndex, seasonName);
+        for (const s of streams) {
+            const key = s.url + '|' + s.name;
+            if (!seenUrls.has(key)) {
+                seenUrls.add(key);
+                allStreams.push(s);
+            }
+        }
     }
 
-    const sourceUrls = episodeUrls[epIndex];
-    const streams = collectSourceUrls(sourceUrls).map(s => {
-        const label = s.sourceIndex < SOURCE_LABELS.length ? SOURCE_LABELS[s.sourceIndex] : `Source ${s.sourceIndex + 1}`;
-        return buildStreamEntry(s.url, label, lang === 'vf' ? 'VF' : 'VOSTFR', matchedSaison.name || 'Saison ' + matchedSaison.id);
-    });
-
-    console.log(`[Mugiwara] Found ${streams.length} sources for S${season}E${episodeNum}`);
-    return await resolveStreams(streams);
+    console.log(`[Mugiwara] Found ${allStreams.length} sources for S${season}E${episodeNum} (${langs.filter(l => matchedSaison.lang && matchedSaison.lang[l]).map(l => l.toUpperCase()).join('/')})`);
+    return await resolveStreams(allStreams);
 }

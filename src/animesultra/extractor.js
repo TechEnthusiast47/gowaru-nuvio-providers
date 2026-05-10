@@ -47,25 +47,18 @@ async function searchAnime(title) {
         $('a.film-poster-ahref.item-qtip').each((i, el) => {
             const t = $(el).attr('title');
             const id = $(el).attr('data-id');
+            const href = $(el).attr('href');
             if (t && id && id.length > 0 && !t.includes("' + item.name + '")) {
-                const lang = detectLang(t);
-                if (lang) {
-                    const slug = slugify(t);
-                    const href = `/anime-${lang}/${id}-${slug}-au.html`;
-                    add(href, t);
-                } else {
-                    const slug = slugify(t);
-                    const href = `/anime-vostfr/${id}-${slug}-au.html`;
-                    add(href, t);
-                }
+                add(href || t, t);
             }
         });
 
+        // Fallback for items without data-id: use actual href from site
         if (results.length === 0) {
-            $('a[href*="au.html"]').each((i, el) => {
+            $('a[href*="-au.html"]').each((i, el) => {
                 const h = $(el).attr('href');
                 const t = $(el).attr('title') || $(el).text().trim();
-                if (h && t) add(h, t);
+                if (h && t && !t.includes('Surprenez-moi')) add(h, t);
             });
         }
 
@@ -119,14 +112,23 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
     };
 
     const firstTitle = titlesOrdered[0];
-    const frenchAlt = titlesOrdered.find(t => /^L['\u2019]/i.test(t.trim()) && t.length < 60);
 
     if (firstTitle) await trySearch(firstTitle);
-    if (frenchAlt && frenchAlt !== firstTitle) await trySearch(frenchAlt);
+
+    // Find French titles (contain French accented characters or start with L')
+    const frenchTitles = titlesOrdered.filter(t => 
+        t !== firstTitle && t.length < 60 && 
+        (/^L['\u2019]/i.test(t.trim()) || /[àâéèêëîïôùûüç]/i.test(t))
+    );
+
+    for (const ft of frenchTitles) {
+        if (matches.length > 8) break;
+        await trySearch(ft);
+    }
 
     for (const title of titlesOrdered) {
         if (matches.length > 8) break;
-        if (title === firstTitle || title === frenchAlt) continue;
+        if (title === firstTitle || frenchTitles.includes(title)) continue;
         if (title.length > 50) continue;
         await trySearch(title);
     }
@@ -181,7 +183,10 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
             
             const html = await getFullStory(newsId);
             
-            if (!html) continue;
+            if (!html) {
+                console.log(`[AnimesUltra DEBUG] getFullStory(${newsId}) returned null`);
+                continue;
+            }
             
             const $ = cheerio.load(html);
 
@@ -194,7 +199,17 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
                 }
             });
 
-            if (epHrefs.length === 0) continue;
+            console.log(`[AnimesUltra DEBUG] match=${newsId} title="${match.title}" epHrefs=${epHrefs.length} targetEps=[${targetEpisodes}]`);
+            if (epHrefs.length === 0) {
+                // Log all available data-numbers for debugging
+                const avail = [];
+                $('.ep-item').each((i, el) => {
+                    const epNum = $(el).attr('data-number');
+                    if (epNum) avail.push(epNum);
+                });
+                console.log(`[AnimesUltra DEBUG] available data-numbers: [${avail.slice(0,5).join(',')}${avail.length > 5 ? '...' : ''}] (${avail.length} total)`);
+                continue;
+            }
 
             processedCount++;
 
@@ -252,10 +267,10 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
     }
 
     // Fallback: offset-based episode matching for multi-part seasons
+    console.log(`[AnimesUltra DEBUG] offset fallback check: streams=${streams.length}, season=${season}, matches=${matches.length}`);
     if (streams.length === 0 && season && matches.length > 1) {
-        const langMatches = matches.filter(m => !detectLang(m.title) || detectLang(m.title) === 'vostfr');
         const seasonParts = [];
-        for (const m of langMatches) {
+        for (const m of matches) {
             const sNum = parseInt(m.title.match(/saison\s*(\d+)/i)?.[1], 10);
             const pNum = parseInt(m.title.match(/(?:partie|part)\s*(\d+)/i)?.[1], 10);
             if (sNum === season) {
@@ -271,6 +286,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
             }
         }
         seasonParts.sort((a, b) => a.partNum - b.partNum);
+        console.log(`[AnimesUltra DEBUG] seasonParts: ${seasonParts.map(p => 'P'+p.partNum+':'+p.episodeCount+'eps').join(', ')}`);
         let cumOffset = 0;
         for (const sp of seasonParts) {
             const $c = cheerio.load(sp.html);
@@ -287,6 +303,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
                     }
                 }
             });
+            console.log(`[AnimesUltra DEBUG] offset: part=${sp.partNum} cumOffset=${cumOffset} epHrefs=${epHrefs.length}`);
             if (epHrefs.length > 0) {
                 let lang = "VOSTFR";
                 const match = sp.match;
