@@ -185,11 +185,16 @@ export async function expandStreamQualities(streams) {
 
 export async function safeFetch(url, options = {}) {
     try {
-        const response = await fetch(url, {
-            ...options,
-            headers: { ...HEADERS, ...options.headers },
+        const { timeout, ...rest } = options;
+        const fetchOpts = {
+            ...rest,
+            headers: { ...HEADERS, ...rest.headers },
             redirect: 'follow'
-        });
+        };
+        if (timeout > 0 && typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+            fetchOpts.signal = AbortSignal.timeout(timeout);
+        }
+        const response = await fetch(url, fetchOpts);
         if (!response) return null;
 
         const status = response.status;
@@ -654,7 +659,7 @@ export async function resolveStream(stream, depth = 0) {
         if (urlLower.includes('sibnet.ru')) result = await resolveSibnet(originalUrl);
         else if (urlLower.includes('vidmoly.')) result = await resolveVidmoly(originalUrl);
         else if (urlLower.includes('uqload.') || urlLower.includes('oneupload.')) result = await resolveUqload(originalUrl);
-        else if (urlLower.includes('voe') || urlLower.includes('maryspecialwatch') || urlLower.includes('charlestoughrace') || urlLower.includes('sandratableother')) result = await resolveVoe(originalUrl);
+        else if (urlLower.includes('voe') || urlLower.includes('weneverbeenfree') || urlLower.includes('maryspecialwatch') || urlLower.includes('charlestoughrace') || urlLower.includes('sandratableother')) result = await resolveVoe(originalUrl);
         else if (urlLower.includes('streamtape.com') || urlLower.includes('stape')) result = await resolveStreamtape(originalUrl);
         else if (urlLower.includes('dood') || urlLower.includes('ds2play') || urlLower.includes('bigwar5')) result = await resolveDood(originalUrl);
         else if (urlLower.includes('moonplayer') || urlLower.includes('filemoon')) result = await resolveMoon(originalUrl);
