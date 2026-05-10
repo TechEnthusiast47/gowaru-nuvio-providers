@@ -8,6 +8,40 @@ import { resolveStream } from "../utils/resolvers.js";
 import { getImdbId, getAbsoluteEpisode } from "../utils/armsync.js";
 import { getTmdbTitles } from "../utils/metadata.js";
 const BASE_URL = "https://voir-anime.to";
+const HEAD_TIMEOUT = 10000;
+const PAGE_TIMEOUT = 20000;
+const HOST_TIMEOUT = 20000;
+const SEARCH_TIMEOUT = 20000;
+const GLOBAL_TIMEOUT = 90000;
+
+async function fetchWithRetry(url, options = {}, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fetchText(url, options);
+    } catch (err) {
+      if (err.message && /HTTP error 4(?:0[0-9]|1[0-79]|29)/.test(err.message)) throw err;
+      if (i === retries) throw err;
+    }
+  }
+}
+
+async function withGlobalTimeout(promise, ms) {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    try {
+      const signal = AbortSignal.timeout(ms);
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          if (signal.aborted) return reject(new Error('Page timeout'));
+          signal.addEventListener('abort', () => reject(new Error('Page timeout')));
+        })
+      ]);
+    } catch (e) {
+      if (e.message === 'Page timeout') throw e;
+    }
+  }
+  return promise;
+}
 
 /**
  * Clean title to create a slug
@@ -101,13 +135,11 @@ async function searchAnime(title, season = 1) {
   const allSlugs = [...new Set(slugCandidates.filter(Boolean))];
   console.log(`[VoirAnime] Probing slugs (S${season}): ${allSlugs.join(", ")}`);
 
-  const validPredictions = [];
-  for (const slug of allSlugs) {
-    const url = `${BASE_URL}/anime/${slug}/`;
-    try {
-      await fetchText(url, { method: "HEAD" });
-      console.log(`[VoirAnime] Predicted slug found: ${slug}`);
-      validPredictions.push({
+  const probeResults = await Promise.allSettled(
+    allSlugs.map(async (slug) => {
+      const url = `${BASE_URL}/anime/${slug}/`;
+      await fetchText(url, { method: "HEAD", timeout: HEAD_TIMEOUT });
+      return {
         title:
           title +
           (slug.includes("vostfr")
@@ -116,18 +148,23 @@ async function searchAnime(title, season = 1) {
               ? " VF"
               : ""),
         url: url,
-      });
-    } catch (e) {
-      /* Predict failed */
-    }
-  }
+      };
+    })
+  );
 
-  if (validPredictions.length > 0) return validPredictions;
+  const validPredictions = probeResults
+    .filter(r => r.status === "fulfilled")
+    .map(r => r.value);
+
+  if (validPredictions.length > 0) {
+    console.log(`[VoirAnime] Predicted slugs found: ${validPredictions.map(v => v.url).join(", ")}`);
+    return validPredictions;
+  }
 
   // Fallback: keyword search
   try {
-    const searchUrl = `${BASE_URL}/?s=${encodeURIComponent(title)}`;
-    const html = await fetchText(searchUrl);
+    const searchUrl = `${BASE_URL}/?post_type=wp-manga&s=${encodeURIComponent(title)}`;
+    const html = await fetchText(searchUrl, { timeout: SEARCH_TIMEOUT });
     const $ = cheerio.load(html);
 
     const results = [];
@@ -145,6 +182,7 @@ async function searchAnime(title, season = 1) {
     const baseSlugsFromSearch = [
       ...new Set(results.map((r) => extractBaseSlug(r.url)).filter(Boolean)),
     ];
+    const derivedProbes = [];
     for (const bs of baseSlugsFromSearch) {
       const romanSuffix = toRoman(season);
       const seasonSlugs =
@@ -159,14 +197,18 @@ async function searchAnime(title, season = 1) {
             ];
       for (const sl of seasonSlugs) {
         const url = `${BASE_URL}/anime/${sl}/`;
-        try {
-          await fetchText(url, { method: "HEAD" });
-          console.log(`[VoirAnime] Derived slug found: ${sl}`);
-          return [{ title: title, url: url }];
-        } catch (e) {
-          /* try next */
-        }
+        derivedProbes.push(
+          fetchText(url, { method: "HEAD", timeout: HEAD_TIMEOUT })
+            .then(() => ({ title: title, url: url }))
+            .catch(() => null)
+        );
       }
+    }
+    const derivedResults = await Promise.allSettled(derivedProbes);
+    const firstFound = derivedResults.find(r => r.status === "fulfilled" && r.value);
+    if (firstFound) {
+      console.log(`[VoirAnime] Derived slug found: ${firstFound.value.url}`);
+      return [firstFound.value];
     }
 
     // Filter search results by season relevance
@@ -224,6 +266,10 @@ async function searchAnime(title, season = 1) {
 }
 
 export async function extractStreams(tmdbId, mediaType, season, episode) {
+  return withGlobalTimeout(_extractStreams(tmdbId, mediaType, season, episode), GLOBAL_TIMEOUT);
+}
+
+async function _extractStreams(tmdbId, mediaType, season, episode) {
   const titles = await getTmdbTitles(tmdbId, mediaType);
   if (titles.length === 0) return [];
 
@@ -243,11 +289,26 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
   // ------------------------------------
 
   let matches = [];
-  // Try titles in order: EN first, then FR (slug "shingeki-no-kyojin" found via EN search results)
+  let fallbackMatches = [];
+  // Try titles in order: EN first, then FR
   for (const title of titles) {
-    matches = await searchAnime(title, season);
-    if (matches && matches.length > 0) break;
+    const result = await searchAnime(title, season);
+    if (result && result.length > 0) {
+      // Check if any result is explicitly for the requested season or has no season indicator
+      const hasExplicitSeason = result.some(m => {
+        const s = m.url.match(/saison[_-](\d+)/i);
+        return s && parseInt(s[1]) === season;
+      });
+      const hasNoSeason = result.some(m => !m.url.match(/saison[_-]\d+/i));
+      if (hasExplicitSeason || hasNoSeason) {
+        matches = result;
+        break;
+      }
+      // All results are for wrong seasons; save as fallback and continue searching
+      if (!fallbackMatches.length) fallbackMatches = result;
+    }
   }
+  if (!matches.length) matches = fallbackMatches;
 
   if (!matches || matches.length === 0) return [];
 
@@ -289,7 +350,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
     }
 
     try {
-      const html = await fetchText(animeUrl);
+      const html = await fetchWithRetry(animeUrl, { timeout: PAGE_TIMEOUT });
       const $ = cheerio.load(html);
 
       const paddings = ["", "0", "00"];
@@ -347,13 +408,15 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
 
       if (!episodeUrl) continue;
 
-      // Verify the found episode actually belongs to the requested season
+      // Verify the found episode actually belongs to the requested season.
+      // Skip check when absolute episode is available (site may number seasons differently than TMDB,
+      // e.g., Overlord II is "saison-2" on site but season=1 on TMDB).
       const epSaisonMatch = episodeUrl.match(/saison[_-](\d+)/i);
-      if (epSaisonMatch && parseInt(epSaisonMatch[1]) !== season) {
+      if (epSaisonMatch && parseInt(epSaisonMatch[1]) !== season && targetEpisodes.length === 1) {
         continue;
       }
 
-      const epRawHtml = await fetchText(episodeUrl);
+      const epRawHtml = await fetchWithRetry(episodeUrl, { timeout: PAGE_TIMEOUT });
       const ep$ = cheerio.load(epRawHtml);
 
       const hosts = [];
@@ -361,8 +424,9 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
         const val = ep$(el).val();
         if (val && val !== "Choisir un lecteur") hosts.push(val);
       });
-      // Filter out hosts known to produce time-limited URLs unreliable in production
-      const filteredHosts = hosts.filter(h => !/YU|YourUpload/i.test(h));
+      // Filter out hosts known to produce time-limited URLs unreliable in production,
+      // and hosts that always hang or fail (client-side JS players, anti-bot, etc.)
+      const filteredHosts = hosts.filter(h => !/YU|YourUpload|MOON\b|Lecteur\s+SB/i.test(h));
 
       if (filteredHosts.length === 0) {
         // Catch any external iframe (not voiranime's own domain)
@@ -389,7 +453,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode) {
         const hostPromises = filteredHosts.map(async (host) => {
           try {
             const hostUrl = `${episodeUrl}${episodeUrl.includes("?") ? "&" : "?"}host=${encodeURIComponent(host)}`;
-            const hostHtml = await fetchText(hostUrl);
+            const hostHtml = await fetchText(hostUrl, { timeout: 20000 });
             // Parse iframe src more flexibly (any attribute order)
             const iframeMatch = hostHtml.match(
               /<iframe[^>]+src=["'](https?:\/\/[^"']+)["']/i,
