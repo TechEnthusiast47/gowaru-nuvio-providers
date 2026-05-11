@@ -23,7 +23,7 @@ To use these providers in your Nuvio app:
 
 ## 🇫🇷 Included Providers
 
-This bundle integrates 12 pillars of the French streaming scene:
+This bundle integrates 13 pillars of the French streaming scene:
 
 | Provider | Description | Languages | Status |
 | :--- | :--- | :--- | :---: |
