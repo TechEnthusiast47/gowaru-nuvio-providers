@@ -1,6 +1,6 @@
 /**
  * Video Link Resolvers for common hosts
- * Highly optimized for Nuvio (Hermes/React Native)
+ * Optimized for QuickJS (Nuvio runtime)
  */
 
 const HEADERS = {
@@ -165,13 +165,34 @@ function appendQualityToTitle(title, quality, codec, fps) {
     return `${title} [${parts.join(' ')}]`;
 }
 
+function inferType(url) {
+    if (!url || typeof url !== 'string') return null;
+    const u = url.toLowerCase();
+    if (u.includes('.m3u8') || u.includes('/hls/') || u.includes('/hls2/') || u.includes('master.m3u8')) return 'hls';
+    if (u.includes('.mp4')) return 'mp4';
+    if (u.includes('.mkv')) return 'mkv';
+    if (u.includes('.webm')) return 'webm';
+    return null;
+}
+
+function inferLanguage(stream) {
+    if (stream.language) return stream.language;
+    const name = stream.name || '';
+    const match = name.match(/\((\w+)\)/);
+    if (match) {
+        const lang = match[1].toUpperCase();
+        if (['VF', 'VOSTFR', 'VO', 'VOSTF', 'VOA', 'VOST'].includes(lang)) return lang;
+    }
+    return null;
+}
+
 async function expandSingleStreamQualities(stream, options = {}) {
     if (!stream || !stream.url || typeof stream.url !== 'string') return [];
     const url = stream.url;
     const lower = url.toLowerCase();
 
     if (!lower.includes('.m3u8') && !lower.includes('/hls/')) {
-        return [{ ...stream, quality: normalizeQualityLabel(stream.quality || 'HD') }];
+        return [{ ...stream, quality: normalizeQualityLabel(stream.quality || 'HD'), type: inferType(url) }];
     }
 
     const cacheKey = url;
@@ -182,12 +203,12 @@ async function expandSingleStreamQualities(stream, options = {}) {
 
     const res = await safeFetch(url, { headers: stream.headers || {} });
     if (!res) {
-        return [{ ...stream, quality: normalizeQualityLabel(stream.quality || 'HD') }];
+        return [{ ...stream, quality: normalizeQualityLabel(stream.quality || 'HD'), type: 'hls' }];
     }
 
     const manifest = await res.text();
     if (!/#EXT-X-STREAM-INF/i.test(manifest)) {
-        return [{ ...stream, quality: normalizeQualityLabel(stream.quality || 'HD') }];
+        return [{ ...stream, quality: normalizeQualityLabel(stream.quality || 'HD'), type: 'hls' }];
     }
 
     const lines = manifest.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -228,6 +249,7 @@ async function expandSingleStreamQualities(stream, options = {}) {
             ...stream,
             url: variantUrl,
             quality: normalizeQualityLabel(quality || stream.quality || 'HD'),
+            type: 'hls',
             codec: parsedCodec.video?.codec || null,
             audioCodec: parsedCodec.audio?.codec || null,
             fps,
@@ -242,7 +264,7 @@ async function expandSingleStreamQualities(stream, options = {}) {
     }
 
     if (variants.length === 0) {
-        return [{ ...stream, quality: normalizeQualityLabel(stream.quality || 'HD') }];
+        return [{ ...stream, quality: normalizeQualityLabel(stream.quality || 'HD'), type: 'hls' }];
     }
 
     const unique = [];
@@ -293,7 +315,7 @@ export async function expandStreamQualities(streams, options = {}) {
                 expanded.push(variant);
             }
         } catch (e) {
-            if (stream) expanded.push({ ...stream, quality: normalizeQualityLabel(stream.quality || 'HD') });
+            if (stream) expanded.push({ ...stream, quality: normalizeQualityLabel(stream.quality || 'HD'), type: inferType(stream.url) });
         }
     }
 
@@ -307,7 +329,13 @@ export async function expandStreamQualities(streams, options = {}) {
         deduped.push(stream);
     }
 
-    const sorted = sortStreams(deduped);
+    let sorted = sortStreams(deduped);
+
+    sorted = sorted.map(s => ({
+        ...s,
+        type: s.type || inferType(s.url),
+        language: inferLanguage(s) || s.language || null,
+    }));
 
     if (options.preferredCodec) {
         return filterByPreferredCodec(sorted, options.preferredCodec);
