@@ -140,6 +140,8 @@ async function getKitsuTitles(kitsuId, mediaType, opts = {}) {
  * Returns an array with [English title, French title, Original title (romaji)]
  * All unique values, ordered by priority for searching.
  * Generates season-aware variants (e.g. "Overlord Season 1") for TV.
+ * Le tableau retourné a une propriété _metadata attachée contenant
+ * { isAnime, name, originalLanguage } pour éviter un fetch supplémentaire.
  *
  * @param {string|number} tmdbId
  * @param {'tv'|'movie'} mediaType
@@ -150,6 +152,7 @@ async function getKitsuTitles(kitsuId, mediaType, opts = {}) {
 async function getTMDBTitlesById(tmdbId, mediaType, opts = {}) {
     const type = mediaType === 'movie' ? 'movie' : 'tv';
     const titles = [];
+    let metadata = null;
 
     try {
         const mainUrl = `${TMDB_API_BASE}/${type}/${tmdbId}?api_key=${TMDB_API_KEY}&language=en-US`;
@@ -166,6 +169,15 @@ async function getTMDBTitlesById(tmdbId, mediaType, opts = {}) {
             const data = await mainRes.json();
             const titleEn = (type === 'movie' ? data.title : data.name)?.trim();
             const titleOriginal = (type === 'movie' ? data.original_title : data.original_name)?.trim();
+
+            // Extraire les métadonnées depuis la même réponse (aucun fetch supplémentaire)
+            if (data) {
+                metadata = {
+                    isAnime: data.original_language === 'ja' || (data.genres || []).some(g => g.id === 16),
+                    name: data.name || data.title || '',
+                    originalLanguage: data.original_language || ''
+                };
+            }
 
             if (titleEn) titles.push(titleEn);
             if (titleOriginal && titleOriginal !== titleEn && isLatinText(titleOriginal)) {
@@ -237,13 +249,73 @@ async function getTMDBTitlesById(tmdbId, mediaType, opts = {}) {
         return true;
     });
 
+    // Attacher les métadonnées au tableau pour éviter un fetch supplémentaire
+    if (metadata) {
+        uniqueTitles._metadata = metadata;
+    }
+
     console.log(`[Metadata] Titles for ${tmdbId}: ${uniqueTitles.join(' | ')}`);
     return uniqueTitles;
 }
 
 /**
+ * Cherche un anime sur Kitsu par nom, valide le résultat,
+ * puis tente de trouver le bon TMDB ID.
+ * Ne retourne des titres que si la correspondance est solide (titre japonais présent).
+ */
+async function kitsuSearchFallback(tmdbName, mediaType, opts) {
+    try {
+        if (!tmdbName || tmdbName.length < 3) return [];
+
+        const url = `https://kitsu.io/api/edge/anime?filter[text]=${encodeURIComponent(tmdbName)}&page[limit]=5`;
+        const res = await safeFetch(url);
+        if (!res) return [];
+        const data = await res.json();
+        if (!data?.data?.length) return [];
+
+        for (const anime of data.data) {
+            const attrs = anime.attributes || {};
+            const jaTitle = attrs.titles?.ja_jp?.trim();
+            const canonicalTitle = attrs.canonicalTitle?.trim();
+            const enTitle = attrs.titles?.en?.trim() || canonicalTitle;
+
+            // Valider : doit avoir un titre japonais (confirme que c'est un anime)
+            if (!jaTitle && attrs.originalLanguage !== 'ja') continue;
+            if (!enTitle) continue;
+
+            console.log(`[Metadata] Kitsu search: "${tmdbName}" → "${enTitle}" (ja=${!!jaTitle})`);
+
+            // Rechercher ce titre sur TMDB
+            const foundTmdbId = await searchTmdbByTitle(enTitle, mediaType);
+            if (foundTmdbId) {
+                // Utiliser getTMDBTitlesById qui contient maintenant les métadonnées intégrées
+                const altTitles = await getTMDBTitlesById(String(foundTmdbId), mediaType, opts);
+                const meta = altTitles._metadata;
+                if (meta && meta.isAnime) {
+                    console.log(`[Metadata] Fallback success: TMDB ID ${foundTmdbId} for "${enTitle}"`);
+                    return altTitles;
+                }
+            }
+
+            // Dernier recours : utiliser les titres Kitsu directement
+            console.log(`[Metadata] Fallback: using Kitsu titles directly for ${anime.id}`);
+            return await getKitsuTitles(anime.id, mediaType, opts);
+        }
+
+        console.log(`[Metadata] Kitsu search: no valid results for "${tmdbName}"`);
+        return [];
+    } catch (e) {
+        console.warn(`[Metadata] Kitsu fallback error: ${e.message}`);
+        return [];
+    }
+}
+
+/**
  * Get multiple titles for a given ID (supports TMDB IDs and Kitsu IDs).
  * Detects ID format and dispatches to the appropriate handler.
+ * Validation intégrée : si un TMDB ID pointe vers du contenu non-anime,
+ * tente un fallback automatique via Kitsu.
+ * Pas de map hardcodée, solution scalable.
  *
  * @param {string|number} id
  * @param {'tv'|'movie'} mediaType
@@ -254,16 +326,52 @@ async function getTMDBTitlesById(tmdbId, mediaType, opts = {}) {
 export async function getTmdbTitles(id, mediaType, opts = {}) {
     const kitsuMatch = parseKitsuId(id);
     let effectiveSeason = opts.season != null ? opts.season : null;
+
+    console.log(`[Metadata] getTmdbTitles: id="${id}" type="${mediaType}" season=${opts.season}`);
+
+    // Si l'ID est un Kitsu ID, le traiter directement
     if (kitsuMatch) {
         const kitsuId = kitsuMatch[1];
         const seasonFromId = kitsuMatch[2] ? parseInt(kitsuMatch[2], 10) : null;
         effectiveSeason = opts.season != null ? opts.season : seasonFromId;
+        console.log(`[Metadata] Kitsu ID detected: ${kitsuId}, season=${effectiveSeason}`);
         const titles = await getKitsuTitles(kitsuId, mediaType, { ...opts, season: effectiveSeason });
         titles.effectiveSeason = effectiveSeason;
         return titles;
     }
 
+    // Gérer les IDs null/undefined/empty
+    if (!id) {
+        console.error(`[Metadata] Invalid/null TMDB ID received: "${id}"`);
+        const emptyTitles = [];
+        emptyTitles.effectiveSeason = effectiveSeason;
+        return emptyTitles;
+    }
+
+    // Obtenir les titres TMDB par ID (les métadonnées sont intégrées, pas de fetch supplémentaire)
     const titles = await getTMDBTitlesById(id, mediaType, opts);
+
+    // Validation intégrée via les métadonnées attachées par getTMDBTitlesById
+    if (mediaType === 'tv' && titles.length > 0 && titles._metadata) {
+        const meta = titles._metadata;
+        
+        if (!meta.isAnime) {
+            console.warn(`[Metadata] ⚠ ID ${id} = "${meta.name}" (${meta.originalLanguage}) - not anime!`);
+            
+            // Fallback Kitsu
+            const altTitles = await kitsuSearchFallback(titles[0], mediaType, opts);
+            if (altTitles.length > 0) {
+                console.log(`[Metadata] Fallback success: ${altTitles.length} alternative titles`);
+                altTitles.effectiveSeason = effectiveSeason;
+                return altTitles;
+            }
+            
+            console.warn(`[Metadata] Fallback failed for "${meta.name}", using original titles`);
+        } else {
+            console.log(`[Metadata] ✓ ID ${id}: "${meta.name}" confirmed anime (${meta.originalLanguage})`);
+        }
+    }
+
     titles.effectiveSeason = effectiveSeason;
     return titles;
 }
