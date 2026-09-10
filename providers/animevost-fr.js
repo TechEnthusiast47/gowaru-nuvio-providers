@@ -1,6 +1,6 @@
 /**
  * animevost-fr - Built from src/animevost-fr/
- * Generated: 2026-08-28T14:42:06.810126714Z
+ * Generated: 2026-09-10T22:03:02.618782567Z
  */
 var __provider = (() => {
   var __defProp = Object.defineProperty;
@@ -24,6 +24,12 @@ var __provider = (() => {
     return a;
   };
   var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
+  var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
+    get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
+  }) : x)(function(x) {
+    if (typeof require !== "undefined") return require.apply(this, arguments);
+    throw Error('Dynamic require of "' + x + '" is not supported');
+  });
   var __objRest = (source, exclude) => {
     var target = {};
     for (var prop in source)
@@ -39,7 +45,7 @@ var __provider = (() => {
   var __esm = (fn, res) => function __init() {
     return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
   };
-  var __commonJS = (cb, mod) => function __require() {
+  var __commonJS = (cb, mod) => function __require2() {
     return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
   };
   var __export = (target, all) => {
@@ -301,7 +307,13 @@ var __provider = (() => {
         const status = response.status;
         let bodyText = "";
         try {
-          bodyText = yield response.text();
+          const rawText = yield response.text();
+          if (rawText && rawText.length > MAX_SAFE_FETCH_BODY_BYTES) {
+            console.warn(`[safeFetch] Response truncated (${rawText.length} bytes > ${MAX_SAFE_FETCH_BODY_BYTES}): ${(url || "").slice(0, 100)}`);
+            bodyText = rawText.slice(0, MAX_SAFE_FETCH_BODY_BYTES);
+          } else {
+            bodyText = rawText || "";
+          }
         } catch (e) {
           bodyText = "";
         }
@@ -337,9 +349,16 @@ var __provider = (() => {
       }
     });
   }
-  var HEADERS, USER_AGENT, BASE_HEADERS, FETCH_CACHE_TTL, fetchCache;
+  var MAX_SAFE_FETCH_BODY_BYTES, HAS_NATIVE_CRYPTO, _nodeCrypto, HEADERS, USER_AGENT, BASE_HEADERS, FETCH_CACHE_TTL, fetchCache;
   var init_resolvers = __esm({
     "src/utils/resolvers.js"() {
+      MAX_SAFE_FETCH_BODY_BYTES = 1024 * 1024;
+      HAS_NATIVE_CRYPTO = typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
+      _nodeCrypto = null;
+      try {
+        _nodeCrypto = __require("crypto");
+      } catch (_) {
+      }
       HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
       };

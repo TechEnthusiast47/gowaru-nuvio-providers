@@ -1,6 +1,6 @@
 /**
  * movix - Built from src/movix/
- * Generated: 2026-08-28T14:42:07.978127927Z
+ * Generated: 2026-09-10T22:03:03.059783047Z
  */
 var __provider = (() => {
   var __create = Object.create;
@@ -26,6 +26,12 @@ var __provider = (() => {
     return a;
   };
   var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
+  var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
+    get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
+  }) : x)(function(x) {
+    if (typeof require !== "undefined") return require.apply(this, arguments);
+    throw Error('Dynamic require of "' + x + '" is not supported');
+  });
   var __objRest = (source, exclude) => {
     var target = {};
     for (var prop in source)
@@ -41,7 +47,7 @@ var __provider = (() => {
   var __esm = (fn, res) => function __init() {
     return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
   };
-  var __commonJS = (cb, mod) => function __require() {
+  var __commonJS = (cb, mod) => function __require2() {
     return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
   };
   var __copyProps = (to, from, except, desc) => {
@@ -92,6 +98,7 @@ var __provider = (() => {
   function createProvider(name, extractFn, opts = {}) {
     const PROVIDER_TIMEOUT = safeConfig(`NUVIO_TIMEOUT_${name.toUpperCase().replace(/[^a-z0-9]/g, "_")}`, opts.timeout || PROVIDER_BUDGET_MS);
     const qualityOpts = opts.quality || { includeCodec: true, includeFps: false };
+    const maxStreams = opts.maxStreams || MAX_STREAMS_PER_PROVIDER;
     return function getStreams(_0, _1, _2, _3) {
       return __async(this, arguments, function* (tmdbId, mediaType, season, episode, options = {}) {
         const se = mediaType === "movie" ? "" : ` S${season}E${episode}`;
@@ -99,14 +106,33 @@ var __provider = (() => {
         const externalSignal = options && options.signal ? options.signal : null;
         const { signal } = setupAbortSignal(externalSignal);
         if (isAborted(signal)) return [];
-        console.log(`[${name}] Request: ${label}`);
+        const startTime = Date.now();
+        console.log(`[${name}] Request: ${label} (build ${BUILD_HASH})`);
         try {
-          const streams = yield withTimeout(
+          const rawStreams = yield withTimeout(
             extractFn(tmdbId, mediaType, season, episode, { signal }),
             PROVIDER_TIMEOUT,
             label
           );
-          return yield expandStreamQualities(streams, qualityOpts);
+          const rawList = Array.isArray(rawStreams) ? rawStreams : [];
+          const seenUrls = /* @__PURE__ */ new Set();
+          const dedupedRaw = [];
+          for (const s of rawList) {
+            if (!s) continue;
+            const u = s.url;
+            if (typeof u === "string") {
+              if (!u || u.includes("[object")) continue;
+              const dedupKey = `${u}|${String(s.language || "").toUpperCase()}`;
+              if (seenUrls.has(dedupKey)) continue;
+              seenUrls.add(dedupKey);
+            }
+            dedupedRaw.push(s);
+          }
+          const truncated = dedupedRaw.slice(0, maxStreams * 2);
+          const expanded = yield expandStreamQualities(truncated, qualityOpts);
+          const elapsed = Date.now() - startTime;
+          console.log(`[${name}] Done: ${expanded.length} streams in ${elapsed}ms`);
+          return expanded.slice(0, maxStreams);
         } catch (error) {
           if (error && error.message && error.message.includes("[Timeout]")) {
             console.warn(`[${name}] ${error.message}`);
@@ -117,6 +143,23 @@ var __provider = (() => {
           }
           return [];
         }
+      });
+    };
+  }
+  function getScraperSettings() {
+    try {
+      if (typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS && typeof globalThis.SCRAPER_SETTINGS === "object") {
+        return globalThis.SCRAPER_SETTINGS;
+      }
+    } catch (e) {
+    }
+    return {};
+  }
+  function createSettingsLayout(items) {
+    const layout = Array.isArray(items) ? items : [];
+    return function onSettings() {
+      return __async(this, null, function* () {
+        return layout;
       });
     };
   }
@@ -577,7 +620,13 @@ var __provider = (() => {
         const status = response.status;
         let bodyText = "";
         try {
-          bodyText = yield response.text();
+          const rawText = yield response.text();
+          if (rawText && rawText.length > MAX_SAFE_FETCH_BODY_BYTES) {
+            console.warn(`[safeFetch] Response truncated (${rawText.length} bytes > ${MAX_SAFE_FETCH_BODY_BYTES}): ${(url || "").slice(0, 100)}`);
+            bodyText = rawText.slice(0, MAX_SAFE_FETCH_BODY_BYTES);
+          } else {
+            bodyText = rawText || "";
+          }
         } catch (e) {
           bodyText = "";
         }
@@ -1506,10 +1555,19 @@ var __provider = (() => {
       return __spreadProps(__spreadValues({}, stream), { isDirect: false });
     });
   }
-  var PROVIDER_BUDGET_MS, HEADERS, USER_AGENT, BASE_HEADERS, _atob, CODEC_PREFERENCE, STRICT_QUALITY_TIERS, DEFAULT_QUALITY_TIER, CODEC_PRIORITY, manifestCache, MANIFEST_CACHE_TTL, FETCH_CACHE_TTL, fetchCache, LANGUAGE_CODE_MAP, KNOWN_HOST_NAMES, NEVER_CORRECT_DOMAINS, peeledUrls, AD_IFRAME_PATTERNS, VIDEO_IFRAME_SCORE, BASE_URL_FORBIDDEN_PATTERN;
+  var PROVIDER_BUDGET_MS, MAX_STREAMS_PER_PROVIDER, MAX_SAFE_FETCH_BODY_BYTES, BUILD_HASH, HAS_NATIVE_CRYPTO, _nodeCrypto, HEADERS, USER_AGENT, BASE_HEADERS, _atob, CODEC_PREFERENCE, STRICT_QUALITY_TIERS, DEFAULT_QUALITY_TIER, CODEC_PRIORITY, manifestCache, MANIFEST_CACHE_TTL, FETCH_CACHE_TTL, fetchCache, LANGUAGE_CODE_MAP, KNOWN_HOST_NAMES, NEVER_CORRECT_DOMAINS, peeledUrls, AD_IFRAME_PATTERNS, VIDEO_IFRAME_SCORE, BASE_URL_FORBIDDEN_PATTERN;
   var init_resolvers = __esm({
     "src/utils/resolvers.js"() {
       PROVIDER_BUDGET_MS = 45e3;
+      MAX_STREAMS_PER_PROVIDER = 80;
+      MAX_SAFE_FETCH_BODY_BYTES = 1024 * 1024;
+      BUILD_HASH = true ? "41210d4f" : "dev";
+      HAS_NATIVE_CRYPTO = typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
+      _nodeCrypto = null;
+      try {
+        _nodeCrypto = __require("crypto");
+      } catch (_) {
+      }
       HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
       };
@@ -13553,14 +13611,6 @@ var __provider = (() => {
       return fallback || "";
     }
   }
-  function normalizeLangTag(lang) {
-    const l = (lang || "").toLowerCase();
-    if (l === "vff" || l === "vfq" || l === "vf" || l.includes("french")) return "VF";
-    if (l === "vostfr" || l === "vost" || l.includes("vostfr")) return "VOSTFR";
-    if (l === "default" || l === "multi") return "MULTI";
-    if (l === "vo") return "VO";
-    return (lang || "VF").toUpperCase();
-  }
   var import_cheerio_without_node_native;
   var init_dle_extractor = __esm({
     "src/utils/dle-extractor.js"() {
@@ -13600,6 +13650,34 @@ var __provider = (() => {
   });
 
   // src/movix/extractor.js
+  function normalizeLangTagMovix(lang) {
+    const l = (lang || "").toLowerCase();
+    if (l === "vf") return "VF";
+    if (l === "vff") return "VFF";
+    if (l === "vfq") return "VFQ";
+    if (l === "vostfr" || l === "vost") return "VOSTFR";
+    if (l === "default" || l === "multi") return "MULTI";
+    if (l === "vo") return "VO";
+    return (lang || "").trim() ? String(lang).toUpperCase() : "VF";
+  }
+  function getPrefs() {
+    const s = getScraperSettings() || {};
+    return {
+      language: s.language === "vf" || s.language === "vostfr" ? s.language : "all",
+      skipSlowHosts: s.skipSlowHosts === true
+    };
+  }
+  function filterByLanguagePref(streams, pref) {
+    if (!pref || pref === "all" || !Array.isArray(streams) || streams.length === 0) return streams;
+    const isVF = (s) => {
+      const t = `${s.language || ""} ${s.title || ""} ${s.name || ""}`.toUpperCase();
+      return t.includes("VF") || t.includes("FRENCH") || t.includes("TRUEFRENCH");
+    };
+    const isVOSTFR = (s) => `${s.language || ""} ${s.title || ""} ${s.name || ""}`.toUpperCase().includes("VOSTFR");
+    const wanted = pref === "vf" ? isVF : isVOSTFR;
+    const filtered = streams.filter(wanted);
+    return filtered.length > 0 ? filtered : streams;
+  }
   function streamPriority(url, language) {
     const u = (url || "").toLowerCase();
     let score = 0;
@@ -13615,20 +13693,29 @@ var __provider = (() => {
     else score += 50;
     return score;
   }
-  function isExoPlayableUrl(url) {
+  function isDirectVideoUrl(url) {
     if (!url || typeof url !== "string") return false;
     const u = url.toLowerCase();
     if (u.includes("test-videos.co.uk") || u.includes("sample-videos.com") || u.includes("big_buck_bunny")) return false;
     if (u.includes("/embed") || u.includes("/e/") || u.includes("iframe") || u.includes("index.php")) return false;
     if (u.includes(".m3u8") || u.includes(".mp4") || u.includes(".mkv") || u.includes(".webm") || u.includes(".ts")) return true;
-    if (u.includes("manifest") || u.includes("playlist") || u.includes("/hls/")) return true;
+    if (u.includes("manifest") || u.includes("playlist") || u.includes("/hls/") || u.includes("/hls2/")) return true;
     return false;
+  }
+  function isExoPlayableUrl(url) {
+    return isDirectVideoUrl(url);
   }
   function resolveForExo(stream) {
     return __async(this, null, function* () {
+      var _a, _b, _c, _d;
       let resolved = null;
-      if (isExoPlayableUrl(stream.url)) {
-        resolved = __spreadProps(__spreadValues({}, stream), { isDirect: true });
+      if (isDirectVideoUrl(stream.url)) {
+        const origin = getUrlOrigin(stream.url, SITE_ORIGIN);
+        resolved = __spreadProps(__spreadValues({}, stream), {
+          isDirect: true,
+          type: stream.type || (stream.url.toLowerCase().includes(".m3u8") || stream.url.toLowerCase().includes("/hls") ? "hls" : void 0),
+          headers: __spreadProps(__spreadValues({}, stream.headers || {}), { Referer: ((_a = stream.headers) == null ? void 0 : _a.Referer) || origin + "/", Origin: ((_b = stream.headers) == null ? void 0 : _b.Origin) || origin, "User-Agent": USER_AGENT })
+        });
       } else {
         try {
           resolved = yield withTimeout(resolveStream(stream), 8e3);
@@ -13638,14 +13725,16 @@ var __provider = (() => {
       }
       if (!resolved || !resolved.url || !resolved.isDirect) return null;
       if (!isExoPlayableUrl(resolved.url)) return null;
-      return {
+      const ro = getUrlOrigin(resolved.url, SITE_ORIGIN);
+      return __spreadProps(__spreadValues(__spreadValues({
         name: resolved.name || stream.name,
         title: resolved.title || stream.title,
         url: resolved.url,
         quality: resolved.quality || "HD",
-        isDirect: true,
-        headers: __spreadProps(__spreadValues({}, resolved.headers), { "User-Agent": USER_AGENT })
-      };
+        isDirect: true
+      }, resolved.type ? { type: resolved.type } : {}), resolved.language || stream.language ? { language: resolved.language || stream.language } : {}), {
+        headers: __spreadProps(__spreadValues({}, resolved.headers || {}), { Referer: ((_c = resolved.headers) == null ? void 0 : _c.Referer) || ro + "/", Origin: ((_d = resolved.headers) == null ? void 0 : _d.Origin) || ro, "User-Agent": USER_AGENT })
+      });
     });
   }
   function fetchFromDomain(baseUrl, tmdbId, mediaType, season) {
@@ -13710,13 +13799,23 @@ var __provider = (() => {
   }
   function pushStream(streams, provider, server, lang, url, quality) {
     if (!url || typeof url !== "string") return;
+    if (url.includes("[object")) return;
     const origin = getUrlOrigin(url, SITE_ORIGIN);
+    const langTag = normalizeLangTagMovix(lang);
+    let hostName = server || "";
+    if (!hostName) {
+      try {
+        hostName = new URL(url).hostname.replace(/^www\./, "").split(".")[0];
+      } catch (e) {
+        hostName = "Player";
+      }
+    }
     streams.push({
       name: "Movix",
-      title: `[${normalizeLangTag(lang)}] ${provider} - ${server || "Player"}`,
+      title: `[${langTag}] ${provider} - ${hostName}`,
       url,
       quality: quality || "HD",
-      language: normalizeLangTag(lang),
+      language: langTag,
       headers: { Referer: origin + "/", Origin: origin, "User-Agent": USER_AGENT }
     });
   }
@@ -13739,7 +13838,14 @@ var __provider = (() => {
           return null;
         }
         console.log(`[Movix] ${results.length} search result(s), trying alternates...`);
-        for (const result of results.slice(0, 5)) {
+        const wantedType = mediaType === "movie" ? "movie" : "tv";
+        const candidates = results.filter((r) => {
+          let rt = r.media_type || r.type || "";
+          if (rt === "series" || rt === "show") rt = "tv";
+          return rt === wantedType || !rt;
+        });
+        const ordered = (candidates.length > 0 ? candidates : results).slice(0, 6);
+        for (const result of ordered) {
           const altId = result.tmdb_id || result.id;
           if (!altId) continue;
           if (String(altId) === String(tmdbId)) continue;
@@ -13773,7 +13879,7 @@ var __provider = (() => {
           if (!supported) continue;
           const path = isMovie ? `${baseUrl}/api/${src.name}/movie/${tmdbId}` : `${baseUrl}/api/${src.name}/tv/${tmdbId}/season/${Number(season) || 1}`;
           console.log(`[Movix] Trying ${src.name}...`);
-          const data = yield fetchJson(path, { retries: 1 });
+          const data = yield fetchJson(path, { retries: 0 });
           if (!data || data.success === false) continue;
           const streams = parseStreams(data, src.name, isMovie, episodeNum);
           if (streams.length > 0) {
@@ -13786,39 +13892,61 @@ var __provider = (() => {
       return found;
     });
   }
-  function resolveStreamsToPlayable(streams) {
+  function resolveStreamsToPlayable(streams, prefs, signal) {
     return __async(this, null, function* () {
       if (streams.length === 0) return [];
+      prefs = prefs || getPrefs();
+      const signalGuard = signal || null;
+      let candidates = filterByLanguagePref(streams, prefs.language);
+      if (prefs.skipSlowHosts) {
+        const withoutSlow = candidates.filter((s) => !SLOW_HOSTS.some((h) => (s.url || "").toLowerCase().includes(h)));
+        if (withoutSlow.length > 0) candidates = withoutSlow;
+      }
       const seen = /* @__PURE__ */ new Set();
       const unique = [];
-      for (const s of streams) {
+      for (const s of candidates) {
         if (!seen.has(s.url)) {
           seen.add(s.url);
           unique.push(s);
         }
       }
       unique.sort((a, b) => streamPriority(a.url, a.language) - streamPriority(b.url, b.language));
-      const MAX_RESOLVE = 5;
-      const TARGET_PLAYABLE = 2;
+      const MAX_RESOLVE = 8;
+      const TARGET_PLAYABLE = 4;
       const playable = [];
       const seenPlayable = /* @__PURE__ */ new Set();
       const startTime = Date.now();
-      const BUDGET_MS = 15e3;
-      const toResolve = unique.slice(0, MAX_RESOLVE);
-      for (const stream of toResolve) {
+      const BUDGET_MS = 2e4;
+      const addPlayable = (result) => {
+        if (result && !seenPlayable.has(result.url)) {
+          seenPlayable.add(result.url);
+          playable.push(result);
+          return true;
+        }
+        return false;
+      };
+      const directCandidates = unique.filter((s) => isDirectVideoUrl(s.url));
+      for (const stream of directCandidates) {
         if (playable.length >= TARGET_PLAYABLE) break;
-        if (Date.now() - startTime > BUDGET_MS) break;
         try {
-          const result = yield resolveForExo(stream);
-          if (result && !seenPlayable.has(result.url)) {
-            seenPlayable.add(result.url);
-            playable.push(result);
-          }
+          addPlayable(yield resolveForExo(stream));
         } catch (e) {
-          console.warn(`[Movix] resolveStream failed: ${e == null ? void 0 : e.message}`);
         }
       }
-      console.log(`[Movix] Total: ${unique.length} streams, ${playable.length} playable (resolved ${Math.min(toResolve.length, MAX_RESOLVE)} in ${Date.now() - startTime}ms)`);
+      console.log(`[Movix] Pass 1 (direct URLs): ${playable.length} playable from ${directCandidates.length} candidate(s)`);
+      if (playable.length < TARGET_PLAYABLE && !isAborted(signalGuard)) {
+        const toResolve = unique.filter((s) => !isDirectVideoUrl(s.url)).slice(0, MAX_RESOLVE);
+        for (const stream of toResolve) {
+          if (playable.length >= TARGET_PLAYABLE) break;
+          if (Date.now() - startTime > BUDGET_MS) break;
+          try {
+            addPlayable(yield resolveForExo(stream));
+          } catch (e) {
+            console.warn(`[Movix] resolveStream failed: ${e == null ? void 0 : e.message}`);
+          }
+        }
+      }
+      console.log(`[Movix] Total: ${unique.length} streams, ${playable.length} playable (${Date.now() - startTime}ms)`);
       return playable;
     });
   }
@@ -13867,12 +13995,12 @@ var __provider = (() => {
         console.log("[Movix] No streams found from any source");
         return [];
       }
-      let playable = yield resolveStreamsToPlayable(allStreams);
+      let playable = yield resolveStreamsToPlayable(allStreams, getPrefs(), signal);
       if (playable.length === 0 && !fallbackTried && !isAborted(signal)) {
         console.log("[Movix] No playable stream after resolution, trying fallback sources (wiflix/j1f/cpasmal)...");
         const fallbackStreams = yield fetchFallbackStreams(tmdbId, isMovie, season, episodeNum, signal);
         if (fallbackStreams.length > 0) {
-          playable = yield resolveStreamsToPlayable(fallbackStreams);
+          playable = yield resolveStreamsToPlayable(fallbackStreams, getPrefs(), signal);
         }
       }
       return playable;
@@ -13904,7 +14032,33 @@ var __provider = (() => {
     "src/movix/index.js"(exports, module) {
       init_extractor();
       init_resolvers();
-      module.exports = { getStreams: createProvider("Movix", extractStreams) };
+      module.exports = {
+        getStreams: createProvider("Movix", extractStreams),
+        // UI de réglages — NuvioMobile uniquement (NuvioTV ignore le hook mais
+        // injecte quand même SCRAPER_SETTINGS si sauvegardés ailleurs)
+        onSettings: createSettingsLayout([
+          { type: "header", label: "Pr\xE9f\xE9rences Movix" },
+          {
+            type: "select",
+            key: "language",
+            label: "Langue pr\xE9f\xE9r\xE9e",
+            description: "Filtre les sources par langue quand c'est possible",
+            defaultValue: "all",
+            options: [
+              { label: "Tout (VF + VOSTFR)", value: "all" },
+              { label: "VF d'abord (filtre VOSTFR)", value: "vf" },
+              { label: "VOSTFR d'abord", value: "vostfr" }
+            ]
+          },
+          {
+            type: "toggle",
+            key: "skipSlowHosts",
+            label: "Ignorer les hosts lents",
+            description: "Exclut les hosts connus pour \xEAtre lents ou dead (dood, streamtape\u2026)",
+            defaultValue: false
+          }
+        ])
+      };
     }
   });
   return require_index();

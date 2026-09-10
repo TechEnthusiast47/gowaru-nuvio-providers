@@ -536,6 +536,43 @@ async function getStreams(tmdbId, mediaType, season, episode) {
 }
 ```
 
+### Settings UI + utilities (recommandé)
+
+Le provider pilote est `src/movix/`. Pattern complet :
+
+```javascript
+// index.js
+import { extractStreams } from './extractor.js';
+import { createProvider, createSettingsLayout } from '../utils/resolvers.js';
+
+module.exports = {
+  getStreams: createProvider('Example', extractStreams),
+  // UI NuvioMobile uniquement (NuvioTV ignore le hook mais injecte quand même
+  // SCRAPER_SETTINGS). Types supportés : header, info, text (isPassword,
+  // placeholder), select (options[{label,value}], defaultValue), toggle.
+  onSettings: createSettingsLayout([
+    { type: 'header', label: 'Préférences' },
+    { type: 'select', key: 'language', label: 'Langue préférée', defaultValue: 'all',
+      options: [{ label: 'Tout', value: 'all' }, { label: 'VF', value: 'vf' }] },
+    { type: 'toggle', key: 'skipSlowHosts', label: 'Ignorer les hosts lents', defaultValue: false },
+  ]),
+};
+
+// extractor.js — lire les réglages (fallback sûr si absents)
+import { getScraperSettings } from '../utils/resolvers.js';
+const s = getScraperSettings(); // {} si l'app n'en injecte pas
+```
+
+Helpers disponibles dans `src/utils/resolvers.js` :
+
+| Helper | Description |
+|---|---|
+| `getScraperSettings()` | Réglages injectés par l'app (`globalThis.SCRAPER_SETTINGS`, `{}` par défaut) |
+| `createSettingsLayout(items)` | Déclare le hook `onSettings()` (UI NuvioMobile) |
+| `fetchBatch(requests, fetchFn, { concurrency, stopOnFirst, staggerMs })` | Fetch parallèle borné ; `staggerMs` espace les départs de requêtes (anti-burst Cloudflare) |
+| `createProvider(name, extractFn, { maxStreams, timeout, quality })` | Wrapper standard : timeout, dédup URL+langue, filtre `[object`, cap `MAX_STREAMS_PER_PROVIDER` (80), expansion qualité |
+| `BUILD_ID` | Hash court injecté à la build (visible en logs : `[Name] Request: … (build abc12345)`) |
+
 ---
 
 ## 9. Common Pitfalls

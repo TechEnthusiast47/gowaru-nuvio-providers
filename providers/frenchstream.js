@@ -1,6 +1,6 @@
 /**
  * frenchstream - Built from src/frenchstream/
- * Generated: 2026-08-28T14:42:07.752127663Z
+ * Generated: 2026-09-10T22:11:11.795271745Z
  */
 var __provider = (() => {
   var __create = Object.create;
@@ -26,6 +26,12 @@ var __provider = (() => {
     return a;
   };
   var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
+  var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
+    get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
+  }) : x)(function(x) {
+    if (typeof require !== "undefined") return require.apply(this, arguments);
+    throw Error('Dynamic require of "' + x + '" is not supported');
+  });
   var __objRest = (source, exclude) => {
     var target = {};
     for (var prop in source)
@@ -41,7 +47,7 @@ var __provider = (() => {
   var __esm = (fn, res) => function __init() {
     return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
   };
-  var __commonJS = (cb, mod) => function __require() {
+  var __commonJS = (cb, mod) => function __require2() {
     return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
   };
   var __copyProps = (to, from, except, desc) => {
@@ -11895,6 +11901,7 @@ var __provider = (() => {
   function createProvider(name, extractFn, opts = {}) {
     const PROVIDER_TIMEOUT = safeConfig(`NUVIO_TIMEOUT_${name.toUpperCase().replace(/[^a-z0-9]/g, "_")}`, opts.timeout || PROVIDER_BUDGET_MS);
     const qualityOpts = opts.quality || { includeCodec: true, includeFps: false };
+    const maxStreams = opts.maxStreams || MAX_STREAMS_PER_PROVIDER;
     return function getStreams(_0, _1, _2, _3) {
       return __async(this, arguments, function* (tmdbId, mediaType, season, episode, options = {}) {
         const se = mediaType === "movie" ? "" : ` S${season}E${episode}`;
@@ -11902,14 +11909,33 @@ var __provider = (() => {
         const externalSignal = options && options.signal ? options.signal : null;
         const { signal } = setupAbortSignal(externalSignal);
         if (isAborted(signal)) return [];
-        console.log(`[${name}] Request: ${label}`);
+        const startTime = Date.now();
+        console.log(`[${name}] Request: ${label} (build ${BUILD_HASH})`);
         try {
-          const streams = yield withTimeout(
+          const rawStreams = yield withTimeout(
             extractFn(tmdbId, mediaType, season, episode, { signal }),
             PROVIDER_TIMEOUT,
             label
           );
-          return yield expandStreamQualities(streams, qualityOpts);
+          const rawList = Array.isArray(rawStreams) ? rawStreams : [];
+          const seenUrls = /* @__PURE__ */ new Set();
+          const dedupedRaw = [];
+          for (const s of rawList) {
+            if (!s) continue;
+            const u = s.url;
+            if (typeof u === "string") {
+              if (!u || u.includes("[object")) continue;
+              const dedupKey = `${u}|${String(s.language || "").toUpperCase()}`;
+              if (seenUrls.has(dedupKey)) continue;
+              seenUrls.add(dedupKey);
+            }
+            dedupedRaw.push(s);
+          }
+          const truncated = dedupedRaw.slice(0, maxStreams * 2);
+          const expanded = yield expandStreamQualities(truncated, qualityOpts);
+          const elapsed = Date.now() - startTime;
+          console.log(`[${name}] Done: ${expanded.length} streams in ${elapsed}ms`);
+          return expanded.slice(0, maxStreams);
         } catch (error) {
           if (error && error.message && error.message.includes("[Timeout]")) {
             console.warn(`[${name}] ${error.message}`);
@@ -11920,6 +11946,23 @@ var __provider = (() => {
           }
           return [];
         }
+      });
+    };
+  }
+  function getScraperSettings() {
+    try {
+      if (typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS && typeof globalThis.SCRAPER_SETTINGS === "object") {
+        return globalThis.SCRAPER_SETTINGS;
+      }
+    } catch (e) {
+    }
+    return {};
+  }
+  function createSettingsLayout(items) {
+    const layout = Array.isArray(items) ? items : [];
+    return function onSettings() {
+      return __async(this, null, function* () {
+        return layout;
       });
     };
   }
@@ -11964,8 +12007,8 @@ var __provider = (() => {
       }
     });
   }
-  function isBudgetExhausted(startTime2, budgetMs) {
-    const elapsed = Date.now() - (startTime2 || 0);
+  function isBudgetExhausted(startTime, budgetMs) {
+    const elapsed = Date.now() - (startTime || 0);
     return elapsed > (budgetMs || TV_BUDGET_MS);
   }
   function createAbortController() {
@@ -12384,7 +12427,13 @@ var __provider = (() => {
         const status = response.status;
         let bodyText = "";
         try {
-          bodyText = yield response.text();
+          const rawText = yield response.text();
+          if (rawText && rawText.length > MAX_SAFE_FETCH_BODY_BYTES) {
+            console.warn(`[safeFetch] Response truncated (${rawText.length} bytes > ${MAX_SAFE_FETCH_BODY_BYTES}): ${(url || "").slice(0, 100)}`);
+            bodyText = rawText.slice(0, MAX_SAFE_FETCH_BODY_BYTES);
+          } else {
+            bodyText = rawText || "";
+          }
         } catch (e) {
           bodyText = "";
         }
@@ -13313,10 +13362,19 @@ var __provider = (() => {
       return __spreadProps(__spreadValues({}, stream), { isDirect: false });
     });
   }
-  var PROVIDER_BUDGET_MS, HEADERS, USER_AGENT, BASE_HEADERS, _atob, CODEC_PREFERENCE, TV_BUDGET_MS, STRICT_QUALITY_TIERS, DEFAULT_QUALITY_TIER, CODEC_PRIORITY, manifestCache, MANIFEST_CACHE_TTL, FETCH_CACHE_TTL, fetchCache, LANGUAGE_CODE_MAP, KNOWN_HOST_NAMES, NEVER_CORRECT_DOMAINS, peeledUrls, AD_IFRAME_PATTERNS, VIDEO_IFRAME_SCORE, BASE_URL_FORBIDDEN_PATTERN;
+  var PROVIDER_BUDGET_MS, MAX_STREAMS_PER_PROVIDER, MAX_SAFE_FETCH_BODY_BYTES, BUILD_HASH, HAS_NATIVE_CRYPTO, _nodeCrypto, HEADERS, USER_AGENT, BASE_HEADERS, _atob, CODEC_PREFERENCE, TV_BUDGET_MS, STRICT_QUALITY_TIERS, DEFAULT_QUALITY_TIER, CODEC_PRIORITY, manifestCache, MANIFEST_CACHE_TTL, FETCH_CACHE_TTL, fetchCache, LANGUAGE_CODE_MAP, KNOWN_HOST_NAMES, NEVER_CORRECT_DOMAINS, peeledUrls, AD_IFRAME_PATTERNS, VIDEO_IFRAME_SCORE, BASE_URL_FORBIDDEN_PATTERN;
   var init_resolvers = __esm({
     "src/utils/resolvers.js"() {
       PROVIDER_BUDGET_MS = 45e3;
+      MAX_STREAMS_PER_PROVIDER = 80;
+      MAX_SAFE_FETCH_BODY_BYTES = 1024 * 1024;
+      BUILD_HASH = true ? "617ae4e1" : "dev";
+      HAS_NATIVE_CRYPTO = typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
+      _nodeCrypto = null;
+      try {
+        _nodeCrypto = __require("crypto");
+      } catch (_) {
+      }
       HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
       };
@@ -13554,14 +13612,14 @@ var __provider = (() => {
   }
   function resolveTargetEpisodes(_0, _1, _2, _3) {
     return __async(this, arguments, function* (tmdbId, mediaType, season, episode, opts = {}) {
-      const { startTime: startTime2, budgetMs = PROVIDER_BUDGET_MS } = opts;
+      const { startTime, budgetMs = PROVIDER_BUDGET_MS } = opts;
       const epNum = parseInt(episode) || 1;
       if (mediaType !== "tv" || !tmdbId || !season) return [epNum];
       const episodes = [epNum];
-      if (startTime2 != null && isBudgetExhausted(startTime2, budgetMs)) return episodes;
+      if (startTime != null && isBudgetExhausted(startTime, budgetMs)) return episodes;
       try {
         const imdbId = yield getImdbId(tmdbId, mediaType);
-        if (imdbId && (startTime2 == null || !isBudgetExhausted(startTime2, budgetMs))) {
+        if (imdbId && (startTime == null || !isBudgetExhausted(startTime, budgetMs))) {
           const absoluteEpisode = yield getAbsoluteEpisode(imdbId, season, epNum);
           if (absoluteEpisode && absoluteEpisode !== epNum) {
             episodes.push(absoluteEpisode);
@@ -14153,6 +14211,23 @@ var __provider = (() => {
   });
 
   // src/frenchstream/extractor.js
+  function getPrefs() {
+    const s = getScraperSettings() || {};
+    const language = s.language === "vf" || s.language === "vostfr" ? s.language : "all";
+    let excludeHosts = [];
+    if (typeof s.excludeHosts === "string") {
+      excludeHosts = s.excludeHosts.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+    } else if (Array.isArray(s.excludeHosts)) {
+      excludeHosts = s.excludeHosts.map((x) => String(x).trim().toLowerCase()).filter(Boolean);
+    }
+    return { language, excludeHosts };
+  }
+  function isHostExcluded(hostKey, excludeHosts) {
+    if (!excludeHosts || excludeHosts.length === 0) return false;
+    const h = String(hostKey || "").toLowerCase();
+    if (!h) return false;
+    return excludeHosts.some((x) => h.includes(x) || x.includes(h));
+  }
   function fetchTmdbJson(url) {
     return __async(this, null, function* () {
       const res = yield safeFetch(url);
@@ -14292,6 +14367,7 @@ var __provider = (() => {
   }
   function searchByTitle(title, mediaType, season) {
     return __async(this, null, function* () {
+      const mt = mediaType === "series" ? "tv" : mediaType;
       const allCards = [];
       const results = yield Promise.allSettled(
         BASE_URLS.map((baseUrl) => {
@@ -14303,9 +14379,9 @@ var __provider = (() => {
       for (const r of results) {
         if (r.status === "fulfilled") allCards.push(...r.value);
       }
-      const filtered = allCards.filter((c) => mediaType === "tv" ? c.isSeries : !c.isSeries);
+      const filtered = allCards.filter((c) => mt === "tv" ? c.isSeries : !c.isSeries);
       if (filtered.length === 0) return [];
-      return filtered.map((c) => __spreadProps(__spreadValues({}, c), { _score: scoreCard(c, title, mediaType, season), _matchedTitle: title })).sort((a, b) => b._score - a._score).slice(0, 8);
+      return filtered.map((c) => __spreadProps(__spreadValues({}, c), { _score: scoreCard(c, title, mt, season), _matchedTitle: title })).sort((a, b) => b._score - a._score).slice(0, 8);
     });
   }
   function getTmdbDetails(tmdbId, mediaType) {
@@ -14318,15 +14394,16 @@ var __provider = (() => {
   function detectSubType(tmdbId, mediaType, titles) {
     return __async(this, null, function* () {
       try {
+        const isTv = mediaType === "tv" || mediaType === "series";
         const d = yield getTmdbDetails(tmdbId, mediaType);
         if (!d) return null;
         const genres = (d.genres || []).map((g) => g.id);
         const isAnim = genres.includes(16);
-        const orig = mediaType === "movie" ? d.original_title : d.original_name;
+        const orig = isTv ? d.original_name : d.original_title;
         const jap = isJapaneseOrChinese(orig);
         const tm = titles.some((t) => ANIME_KEYWORDS.test(t));
         if (isAnim && (jap || tm)) return "anime";
-        if (isAnim && mediaType === "tv") return "cartoon";
+        if (isAnim && isTv) return "cartoon";
       } catch (e) {
         console.warn(`[Frenchstream] detectSubType failed: ${e == null ? void 0 : e.message}`);
       }
@@ -14346,10 +14423,10 @@ var __provider = (() => {
   }
   function languageLabel(k) {
     const l = (k || "").toLowerCase();
-    if (l === "vf" || l === "default" || l === "vfq") return "VF";
+    if (l === "vf" || l === "default" || l === "vfq") return "VFF";
     if (l === "vostfr") return "VOSTFR";
     if (l === "vo") return "VO";
-    return l ? l.toUpperCase() : "VF";
+    return l ? l.toUpperCase() : "VFF";
   }
   function makeStream(name, host, language, url, quality, subType) {
     const lang = languageLabel(language);
@@ -14395,20 +14472,34 @@ var __provider = (() => {
   }
   function collectTvSiteCandidates(epData, episode, subType) {
     const epNum = Number(episode) || 1;
-    const streams = [];
+    const { excludeHosts } = getPrefs();
+    const perLang = [];
     for (const lang of ["vf", "vostfr", "vo"]) {
       const byEp = epData && epData[lang];
       if (!byEp || typeof byEp !== "object") continue;
       const players = byEp[String(epNum)] || byEp[epNum];
       if (!players || typeof players !== "object") continue;
-      for (const host of Object.keys(players)) {
-        const url = players[host];
-        if (typeof url === "string" && url.startsWith("http")) {
-          streams.push(makeStream("Frenchstream", host, lang, url, null, subType));
+      const hosts = Object.keys(players).filter((h) => (players[h] || "").startsWith("http")).sort((a, b) => hostPriority(a, excludeHosts) - hostPriority(b, excludeHosts));
+      perLang.push(hosts.map((host) => makeStream("Frenchstream", host, lang, players[host], null, subType)));
+    }
+    const streams = [];
+    let added = true;
+    for (let i = 0; added; i++) {
+      added = false;
+      for (const list of perLang) {
+        if (list[i]) {
+          streams.push(list[i]);
+          added = true;
         }
       }
     }
     return streams;
+  }
+  function hostPriority(hostKey, excludeHosts) {
+    const h = (hostKey || "").toLowerCase();
+    if (DEAD_HOSTS.some((d) => h.includes(d))) return 200;
+    if (excludeHosts && isHostExcluded(h, excludeHosts)) return 150;
+    return 0;
   }
   function resolveSingle(stream) {
     const promise = resolveStream(stream);
@@ -14418,16 +14509,33 @@ var __provider = (() => {
       new Promise((resolve) => setTimeout(() => resolve(__spreadProps(__spreadValues({}, stream), { isDirect: false })), RESOLVE_TIMEOUT_MS))
     ]);
   }
+  function applyPrefsToCandidates(candidates, prefs) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return candidates;
+    let list = candidates;
+    if (prefs.excludeHosts && prefs.excludeHosts.length > 0) {
+      const filtered = list.filter((s) => !isHostExcluded((s.title || "") + " " + (s.url || ""), prefs.excludeHosts));
+      if (filtered.length > 0) list = filtered;
+    }
+    if (prefs.language === "vf") {
+      const filtered = list.filter((s) => (s.title || "").toUpperCase().includes("VF"));
+      if (filtered.length > 0) list = filtered;
+    } else if (prefs.language === "vostfr") {
+      const filtered = list.filter((s) => (s.title || "").toUpperCase().includes("VOSTFR"));
+      if (filtered.length > 0) list = filtered;
+    }
+    return list;
+  }
   function resolveCandidates(candidates) {
     return __async(this, null, function* () {
+      const prefs = getPrefs();
+      candidates = applyPrefsToCandidates(candidates, prefs);
       const limited = candidates.slice(0, MAX_CANDIDATES);
-      const TARGET_DIRECT = 2;
       const direct = [];
       const embeds = [];
-      const startTime2 = Date.now();
+      const startTime = Date.now();
       for (const candidate of limited) {
         if (direct.length >= TARGET_DIRECT) break;
-        if (Date.now() - startTime2 > RESOLVE_TIMEOUT_MS) break;
+        if (Date.now() - startTime > RESOLVE_TIMEOUT_MS) break;
         try {
           const s = yield resolveSingle(candidate);
           if (s && s.url && s.isDirect) direct.push(s);
@@ -14438,6 +14546,23 @@ var __provider = (() => {
       if (direct.length > 0) return dedupeByUrl(direct);
       if (embeds.length > 0) console.log("[Frenchstream] No direct streams, returning embed fallback (" + embeds.length + ")");
       return dedupeByUrl(embeds);
+    });
+  }
+  function searchByTmdbTag(tmdbId, mediaType) {
+    return __async(this, null, function* () {
+      const prefix = mediaType === "movie" ? "f" : "s";
+      const url = BASE_URL + "/index.php?do=xfsearch&xfname=tagz&xf=" + prefix + "-" + encodeURIComponent(tmdbId);
+      try {
+        const html = yield fetchText(url, { baseUrl: BASE_URL, timeout: 1e4 });
+        const cards = parseSearchCards(html, BASE_URL);
+        const filtered = cards.filter((c) => mediaType === "tv" ? c.isSeries : !c.isSeries);
+        const result = (filtered.length > 0 ? filtered : cards).map((c) => __spreadProps(__spreadValues({}, c), { _score: 200 }));
+        console.log("[Frenchstream] xfsearch " + prefix + "-" + tmdbId + ": " + result.length + " card(s)");
+        return result;
+      } catch (e) {
+        console.warn("[Frenchstream] xfsearch failed: " + e.message);
+        return [];
+      }
     });
   }
   function parseCategoryMovies(html) {
@@ -14477,7 +14602,10 @@ var __provider = (() => {
         const players = data == null ? void 0 : data.players;
         if (!players || typeof players !== "object") return [];
         const streams = [];
-        for (const host of Object.keys(players)) {
+        const { excludeHosts } = getPrefs();
+        const hosts = Object.keys(players).sort((a, b) => hostPriority(a, excludeHosts) - hostPriority(b, excludeHosts));
+        for (const host of hosts) {
+          if (hostPriority(host) >= 200) continue;
           const versions = players[host];
           if (!versions || typeof versions !== "object") continue;
           for (const lang of Object.keys(versions)) {
@@ -14519,6 +14647,23 @@ var __provider = (() => {
   }
   function searchMovieOnSite(tmdbId, titles, subType) {
     return __async(this, null, function* () {
+      const startTime = Date.now();
+      const BUDGET_MS = 4e4;
+      try {
+        const tagged = yield searchByTmdbTag(tmdbId, "movie");
+        if (tagged.length > 0) {
+          const streams = yield verifyAndExtractMovieStreams(tagged[0].newsId, tmdbId, subType);
+          if (streams && streams.length > 0) {
+            const resolved = yield resolveCandidates(streams);
+            console.log("[Frenchstream] Movie found via TMDB tag: " + resolved.length + " streams");
+            return resolved;
+          }
+          console.log("[Frenchstream] Tag match " + tagged[0].newsId + " has no players");
+          return [];
+        }
+      } catch (e) {
+        console.warn("[Frenchstream] TMDB tag lookup failed: " + e.message);
+      }
       const queries = buildTitleQueries(titles);
       let dleFoundCards = false;
       for (const title of queries) {
@@ -14631,20 +14776,36 @@ var __provider = (() => {
       const signal = (options == null ? void 0 : options.signal) || null;
       if (isAborted(signal)) return [];
       setCurrentSignal(signal);
-      const startTime2 = Date.now();
-      const BUDGET_MS2 = 45e3;
+      const startTime = Date.now();
+      const BUDGET_MS = 45e3;
       const titles = yield getTmdbTitles(tmdbId, mediaType, { season });
       if (!titles || titles.length === 0) return [];
       const effectiveSeason = titles.effectiveSeason != null ? titles.effectiveSeason : season;
       const subType = yield detectSubType(tmdbId, mediaType, titles);
       if (subType) console.log("[Frenchstream] subType: " + subType);
-      if (isAborted(signal) || isBudgetExhausted(startTime2, BUDGET_MS2)) return [];
-      if (mediaType === "tv") {
-        const targetEpisodes = yield resolveTargetEpisodes(tmdbId, mediaType, season, episode);
+      if (isAborted(signal) || isBudgetExhausted(startTime, BUDGET_MS)) return [];
+      const isTv = mediaType === "tv" || mediaType === "series";
+      if (isTv) {
+        const targetEpisodes = yield resolveTargetEpisodes(tmdbId, "tv", season, episode);
+        let tagCards = [];
+        try {
+          tagCards = yield searchByTmdbTag(tmdbId, "tv");
+        } catch (e) {
+        }
         let serieTag = null;
         let firstSeasonNewsId = null;
         try {
-          for (const title of buildTitleQueries(titles)) {
+          for (const card of tagCards) {
+            const pageHtml = yield fetchText(card.href || card.baseUrl + "/index.php?newsid=" + card.newsId, { baseUrl: card.baseUrl || BASE_URL, timeout: 1e4 });
+            serieTag = extractSerieTag(pageHtml);
+            const firstSeasonMatch = pageHtml.match(/data-news-id=["']?(\d+)/);
+            if (firstSeasonMatch) firstSeasonNewsId = firstSeasonMatch[1];
+            if (serieTag) {
+              console.log("[Frenchstream] Extracted serie_tag: " + serieTag + " from xfsearch");
+              break;
+            }
+          }
+          if (!serieTag) for (const title of buildTitleQueries(titles)) {
             const ranked = yield searchByTitle(title, "tv", effectiveSeason);
             if (ranked.length > 0 && ranked[0]._score >= MIN_MATCH_SCORE) {
               const card = ranked[0];
@@ -14709,16 +14870,38 @@ var __provider = (() => {
                 const candidates = collectTvSiteCandidates(epData, ep, subType);
                 if (candidates.length > 0) {
                   const streams = yield resolveCandidates(candidates);
-                  console.log("[Frenchstream] Site eps " + target.id + ": " + candidates.length + " candidates, " + streams.length + " streams (ep=" + ep + ")");
-                  return streams;
+                  if (streams.length > 0) {
+                    console.log("[Frenchstream] Site eps " + target.id + ": " + candidates.length + " candidates, " + streams.length + " streams (ep=" + ep + ")");
+                    return streams;
+                  }
                 }
+              }
+            }
+            const last = seasons[seasons.length - 1];
+            if (last && last.id !== target.id) {
+              try {
+                const lastData = yield fetchEpisodeData(last.id);
+                if (lastData) {
+                  for (const ep of targetEpisodes) {
+                    const candidates = collectTvSiteCandidates(lastData, ep, subType);
+                    if (candidates.length > 0) {
+                      const streams = yield resolveCandidates(candidates);
+                      if (streams.length > 0) {
+                        console.log("[Frenchstream] Last-season fallback " + last.id + ": " + streams.length + " streams (ep=" + ep + ")");
+                        return streams;
+                      }
+                    }
+                  }
+                }
+              } catch (e) {
+                console.warn("[Frenchstream] Last-season fallback failed: " + e.message);
               }
             }
           }
         }
         console.warn("[Frenchstream] No streams found via site API, trying DLE search fallback...");
         for (const title of buildTitleQueries(titles)) {
-          if (isBudgetExhausted(startTime2, BUDGET_MS2)) break;
+          if (isBudgetExhausted(startTime, BUDGET_MS)) break;
           try {
             const ranked = yield searchByTitle(title, "tv", effectiveSeason);
             if (ranked.length > 0 && ranked[0]._score >= MIN_MATCH_SCORE) {
@@ -14758,7 +14941,7 @@ var __provider = (() => {
       return [];
     });
   }
-  var import_cheerio_without_node_native2, withCache, MIN_MATCH_SCORE, MOVIE_MATCH_SCORE, MAX_SEARCH_QUERIES, MAX_CANDIDATES, RESOLVE_TIMEOUT_MS, CACHE_TTL_MS, CATEGORY_FETCH_TIMEOUT, TMDB_API_KEY2, TMDB_API_BASE2, GENRE_TO_CATEGORY, ALL_CATEGORIES, ANIME_KEYWORDS;
+  var import_cheerio_without_node_native2, withCache, MIN_MATCH_SCORE, MOVIE_MATCH_SCORE, MAX_SEARCH_QUERIES, MAX_CANDIDATES, TARGET_DIRECT, RESOLVE_TIMEOUT_MS, DEAD_HOSTS, CACHE_TTL_MS, CATEGORY_FETCH_TIMEOUT, TMDB_API_KEY2, TMDB_API_BASE2, GENRE_TO_CATEGORY, ALL_CATEGORIES, ANIME_KEYWORDS;
   var init_extractor = __esm({
     "src/frenchstream/extractor.js"() {
       init_dle_extractor();
@@ -14771,8 +14954,10 @@ var __provider = (() => {
       MIN_MATCH_SCORE = 60;
       MOVIE_MATCH_SCORE = 55;
       MAX_SEARCH_QUERIES = 3;
-      MAX_CANDIDATES = 3;
-      RESOLVE_TIMEOUT_MS = 15e3;
+      MAX_CANDIDATES = 6;
+      TARGET_DIRECT = 4;
+      RESOLVE_TIMEOUT_MS = 22e3;
+      DEAD_HOSTS = ["kakaflix", "dood", "streamtape"];
       CACHE_TTL_MS = 3e5;
       CATEGORY_FETCH_TIMEOUT = 8e3;
       TMDB_API_KEY2 = "8265bd1679663a7ea12ac168da84d2e8";
@@ -14830,7 +15015,36 @@ var __provider = (() => {
     "src/frenchstream/index.js"(exports, module) {
       init_extractor();
       init_resolvers();
-      module.exports = { getStreams: createProvider("Frenchstream", extractStreams) };
+      module.exports = {
+        getStreams: createProvider("Frenchstream", extractStreams),
+        // UI de réglages — NuvioMobile uniquement (NuvioTV ignore le hook mais
+        // injecte quand même SCRAPER_SETTINGS si sauvegardés ailleurs).
+        // Schéma vérifié dans PluginSettingsDialog.kt :
+        //   header/info/text/select(options[{label,value}], defaultValue)/toggle(defaultValue)
+        onSettings: createSettingsLayout([
+          { type: "header", label: "Pr\xE9f\xE9rences FrenchStream" },
+          {
+            type: "select",
+            key: "language",
+            label: "Langue pr\xE9f\xE9r\xE9e",
+            description: "Ne r\xE9sout que les sources de la langue choisie quand c'est possible",
+            defaultValue: "all",
+            options: [
+              { label: "Tout (VF + VOSTFR)", value: "all" },
+              { label: "VF d'abord (filtre VOSTFR)", value: "vf" },
+              { label: "VOSTFR d'abord (filtre VF)", value: "vostfr" }
+            ]
+          },
+          {
+            type: "text",
+            key: "excludeHosts",
+            label: "Hosts exclus",
+            description: "Noms s\xE9par\xE9s par des virgules, ex: dood, streamtape, fsvid. Laisser vide pour tout garder.",
+            placeholder: "dood, streamtape"
+          },
+          { type: "info", label: "Astuce : exclure un host acc\xE9l\xE8re la r\xE9solution (moins de timeouts)." }
+        ])
+      };
     }
   });
   return require_index();

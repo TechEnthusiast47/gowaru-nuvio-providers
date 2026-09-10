@@ -1,6 +1,6 @@
 /**
  * nakios - Built from src/nakios/
- * Generated: 2026-08-28T14:42:08.305128161Z
+ * Generated: 2026-09-10T22:03:03.166783108Z
  */
 var __provider = (() => {
   var __defProp = Object.defineProperty;
@@ -23,6 +23,12 @@ var __provider = (() => {
     return a;
   };
   var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
+  var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
+    get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
+  }) : x)(function(x) {
+    if (typeof require !== "undefined") return require.apply(this, arguments);
+    throw Error('Dynamic require of "' + x + '" is not supported');
+  });
   var __objRest = (source, exclude) => {
     var target = {};
     for (var prop in source)
@@ -38,7 +44,7 @@ var __provider = (() => {
   var __esm = (fn, res) => function __init() {
     return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
   };
-  var __commonJS = (cb, mod) => function __require() {
+  var __commonJS = (cb, mod) => function __require2() {
     return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
   };
   var __async = (__this, __arguments, generator) => {
@@ -92,6 +98,7 @@ var __provider = (() => {
   function createProvider(name, extractFn, opts = {}) {
     const PROVIDER_TIMEOUT = safeConfig(`NUVIO_TIMEOUT_${name.toUpperCase().replace(/[^a-z0-9]/g, "_")}`, opts.timeout || PROVIDER_BUDGET_MS);
     const qualityOpts = opts.quality || { includeCodec: true, includeFps: false };
+    const maxStreams = opts.maxStreams || MAX_STREAMS_PER_PROVIDER;
     return function getStreams(_0, _1, _2, _3) {
       return __async(this, arguments, function* (tmdbId, mediaType, season, episode, options = {}) {
         const se = mediaType === "movie" ? "" : ` S${season}E${episode}`;
@@ -99,14 +106,33 @@ var __provider = (() => {
         const externalSignal = options && options.signal ? options.signal : null;
         const { signal } = setupAbortSignal(externalSignal);
         if (isAborted(signal)) return [];
-        console.log(`[${name}] Request: ${label}`);
+        const startTime = Date.now();
+        console.log(`[${name}] Request: ${label} (build ${BUILD_HASH})`);
         try {
-          const streams = yield withTimeout(
+          const rawStreams = yield withTimeout(
             extractFn(tmdbId, mediaType, season, episode, { signal }),
             PROVIDER_TIMEOUT,
             label
           );
-          return yield expandStreamQualities(streams, qualityOpts);
+          const rawList = Array.isArray(rawStreams) ? rawStreams : [];
+          const seenUrls = /* @__PURE__ */ new Set();
+          const dedupedRaw = [];
+          for (const s of rawList) {
+            if (!s) continue;
+            const u = s.url;
+            if (typeof u === "string") {
+              if (!u || u.includes("[object")) continue;
+              const dedupKey = `${u}|${String(s.language || "").toUpperCase()}`;
+              if (seenUrls.has(dedupKey)) continue;
+              seenUrls.add(dedupKey);
+            }
+            dedupedRaw.push(s);
+          }
+          const truncated = dedupedRaw.slice(0, maxStreams * 2);
+          const expanded = yield expandStreamQualities(truncated, qualityOpts);
+          const elapsed = Date.now() - startTime;
+          console.log(`[${name}] Done: ${expanded.length} streams in ${elapsed}ms`);
+          return expanded.slice(0, maxStreams);
         } catch (error) {
           if (error && error.message && error.message.includes("[Timeout]")) {
             console.warn(`[${name}] ${error.message}`);
@@ -571,7 +597,13 @@ var __provider = (() => {
         const status = response.status;
         let bodyText = "";
         try {
-          bodyText = yield response.text();
+          const rawText = yield response.text();
+          if (rawText && rawText.length > MAX_SAFE_FETCH_BODY_BYTES) {
+            console.warn(`[safeFetch] Response truncated (${rawText.length} bytes > ${MAX_SAFE_FETCH_BODY_BYTES}): ${(url || "").slice(0, 100)}`);
+            bodyText = rawText.slice(0, MAX_SAFE_FETCH_BODY_BYTES);
+          } else {
+            bodyText = rawText || "";
+          }
         } catch (e) {
           bodyText = "";
         }
@@ -607,10 +639,19 @@ var __provider = (() => {
       }
     });
   }
-  var PROVIDER_BUDGET_MS, HEADERS, USER_AGENT, BASE_HEADERS, CODEC_PREFERENCE, STRICT_QUALITY_TIERS, DEFAULT_QUALITY_TIER, CODEC_PRIORITY, manifestCache, MANIFEST_CACHE_TTL, FETCH_CACHE_TTL, fetchCache, LANGUAGE_CODE_MAP;
+  var PROVIDER_BUDGET_MS, MAX_STREAMS_PER_PROVIDER, MAX_SAFE_FETCH_BODY_BYTES, BUILD_HASH, HAS_NATIVE_CRYPTO, _nodeCrypto, HEADERS, USER_AGENT, BASE_HEADERS, CODEC_PREFERENCE, STRICT_QUALITY_TIERS, DEFAULT_QUALITY_TIER, CODEC_PRIORITY, manifestCache, MANIFEST_CACHE_TTL, FETCH_CACHE_TTL, fetchCache, LANGUAGE_CODE_MAP;
   var init_resolvers = __esm({
     "src/utils/resolvers.js"() {
       PROVIDER_BUDGET_MS = 45e3;
+      MAX_STREAMS_PER_PROVIDER = 80;
+      MAX_SAFE_FETCH_BODY_BYTES = 1024 * 1024;
+      BUILD_HASH = true ? "41210d4f" : "dev";
+      HAS_NATIVE_CRYPTO = typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
+      _nodeCrypto = null;
+      try {
+        _nodeCrypto = __require("crypto");
+      } catch (_) {
+      }
       HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
       };
