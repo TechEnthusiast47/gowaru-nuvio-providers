@@ -16,6 +16,20 @@ const { Temporal } = require('@js-temporal/polyfill');
 const esbuild = require('esbuild');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+
+/**
+ * Hash de build court (sha256 du timestamp, 8 chars) injecté dans chaque
+ * bundle via define. Permet de vérifier en logs quelle version du bundle
+ * tourne réellement sur l'appareil (pattern NuvioTV : sha256 du code exécuté).
+ */
+function makeBuildHash() {
+    return crypto.createHash('sha256').update(String(Date.now()) + process.pid).digest('hex').slice(0, 8);
+}
+
+// Un seul hash par invocation de build (tous les providers d'un même run
+// partagent le même ID → facile à corréler dans les logs de l'appareil).
+const BUILD_HASH = makeBuildHash();
 
 const srcDir = path.join(__dirname, 'src');
 const outDir = path.join(__dirname, 'providers');
@@ -60,6 +74,9 @@ async function buildProvider(providerName, minify = false) {
             minify: minify,             // Minify bundle
             sourcemap: false,
             globalName: '__provider',
+            define: {
+                __NUVIO_BUILD_HASH__: JSON.stringify(BUILD_HASH),
+            },
             banner: {
                 js: `/**\n * ${providerName} - Built from src/${providerName}/\n * Generated: ${Temporal.Now.instant().toString()}\n */`
             },

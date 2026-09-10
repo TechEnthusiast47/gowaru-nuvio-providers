@@ -1,6 +1,6 @@
 import { fetchJson, setCurrentSignal } from './http.js';
-import { resolveStream, withTimeout, safeFetch, USER_AGENT, isAborted } from '../utils/resolvers.js';
-import { getUrlOrigin, normalizeLangTag } from '../utils/dle-extractor.js';
+import { resolveStream, withTimeout, safeFetch, USER_AGENT, isAborted, getScraperSettings } from '../utils/resolvers.js';
+import { getUrlOrigin } from '../utils/dle-extractor.js';
 import { getTmdbTitle } from '../utils/search-fallback.js';
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -23,8 +23,9 @@ const FAST_HOSTS = ['voe', 'uqload', 'fsvid', 'vidzy', 'netu', 'younetu', 'sendv
 // api.movix.fun — le repo open-source movixcorp/MovixOpenSource référence les
 // routes /api/{wiflix|j1f|cpasmal}). Utilisées en fallback après fstream :
 //   - wiflix : {players:{vf,vostfr:[{name,url,...}]}}  → films uniquement (TV=404)
-//   - j1f    : {players:{vf,vostfr:[{name,url,...}]}}  → films uniquement (TV="Aucune source unique")
-//   - cpasmal: {links:{vf,vostfr:[...]}}               → films + séries (souvent vide)
+//   - j1f    : {players:{vf,vostfr:[{name,url,...}]}}  → films uniquement (TV=404)
+//   - cpasmal: {links:{vf,vostfr:[...]}}               → films + séries (souvent vide,
+//     renvoie {"error":"Movie/TV Show not found (Cached)"} quand absent)
 // Tous sont déjà couverts par parseStreams (Format 1 players / Format 2 links).
 const FALLBACK_SOURCES = [
     { name: 'wiflix', movie: true, tv: false },
@@ -32,9 +33,58 @@ const FALLBACK_SOURCES = [
     { name: 'cpasmal', movie: true, tv: true },
 ];
 
+// ─── Normalisation des tags de langue (Movix) ───────────────────────────────
+// L'API Movix renvoie EXACTEMENT : 'VF', 'VFQ', 'VFF', 'VOSTFR', 'Default'
+// (vérifié en live : players.{VFQ,VFF,VOSTFR,Default}, episodes[n].languages.{VF,VOSTFR}).
+// Chaque tag doit survivre jusqu'au stream final, sinon NuvioTV/Mobile le classent
+// "Unknown" dans les filtres/tri → "les VF n'apparaissent pas".
+function normalizeLangTagMovix(lang) {
+    const l = (lang || '').toLowerCase();
+    if (l === 'vf') return 'VF';
+    if (l === 'vff') return 'VFF'; // VFF = TrueFrench (audio 100% FR) — NE PAS fusionner avec VF
+    if (l === 'vfq') return 'VFQ'; // VFQ = Québec — NE PAS fusionner avec VF
+    if (l === 'vostfr' || l === 'vost') return 'VOSTFR';
+    if (l === 'default' || l === 'multi') return 'MULTI';
+    if (l === 'vo') return 'VO';
+    return (lang || '').trim() ? String(lang).toUpperCase() : 'VF';
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/** Score de priorité d'un stream : plus bas = résolu en premier */
+// ─── Settings (SCRAPER_SETTINGS injecté par l'app) ──────────────────────────
+
+/**
+ * Lit les préférences utilisateur injectées par l'app (NuvioMobile UI,
+ * NuvioTV SCRAPER_SETTINGS). Fallback sûr si absents ou invalides.
+ */
+function getPrefs() {
+    const s = getScraperSettings() || {};
+    return {
+        language: (s.language === 'vf' || s.language === 'vostfr') ? s.language : 'all',
+        skipSlowHosts: s.skipSlowHosts === true,
+    };
+}
+
+/**
+ * Filtre les streams selon la langue préférée (setting 'language').
+ * 'vf' : écarte les VOSTFR ; 'vostfr' : écarte les VF.
+ * Ne filtre que si au moins un stream de la langue préférée existe
+ * (sinon on garde tout plutôt que de ne rien retourner).
+ */
+function filterByLanguagePref(streams, pref) {
+    if (!pref || pref === 'all' || !Array.isArray(streams) || streams.length === 0) return streams;
+    const isVF = (s) => {
+        const t = `${s.language || ''} ${s.title || ''} ${s.name || ''}`.toUpperCase();
+        return t.includes('VF') || t.includes('FRENCH') || t.includes('TRUEFRENCH');
+    };
+    const isVOSTFR = (s) => `${s.language || ''} ${s.title || ''} ${s.name || ''}`.toUpperCase().includes('VOSTFR');
+    const wanted = pref === 'vf' ? isVF : isVOSTFR;
+    const filtered = streams.filter(wanted);
+    return filtered.length > 0 ? filtered : streams;
+}
+
+/**
+ * Score de priorité d'un stream : plus bas = résolu en premier */
 function streamPriority(url, language) {
     const u = (url || '').toLowerCase();
     let score = 0;
@@ -56,33 +106,62 @@ function streamPriority(url, language) {
     return score;
 }
 
-function isExoPlayableUrl(url) {
+// ─── Résolution ExoPlayer ───────────────────────────────────────────────────
+// isDirectVideoUrl : l'URL est DÉJÀ un flux vidéo jouable par ExoPlayer
+// (.m3u8/.mp4/... ou chemin /hls2/ tokenisé vérifié en live — ExoPlayer les
+// joue sans passer par un extractor). Ces URLs ne doivent JAMAIS être
+// ré-envoyées dans resolveStream : certains extracteurs traitent les chemins
+// inconnus comme des pages d'embed et réintentent l'embed d'origine →
+// 403/timeout → "stream ne se lance jamais".
+function isDirectVideoUrl(url) {
     if (!url || typeof url !== 'string') return false;
     const u = url.toLowerCase();
     if (u.includes('test-videos.co.uk') || u.includes('sample-videos.com') || u.includes('big_buck_bunny')) return false;
     if (u.includes('/embed') || u.includes('/e/') || u.includes('iframe') || u.includes('index.php')) return false;
     if (u.includes('.m3u8') || u.includes('.mp4') || u.includes('.mkv') || u.includes('.webm') || u.includes('.ts')) return true;
-    if (u.includes('manifest') || u.includes('playlist') || u.includes('/hls/')) return true;
+    if (u.includes('manifest') || u.includes('playlist') || u.includes('/hls/') || u.includes('/hls2/')) return true;
     return false;
 }
 
+// Compat : conservé pour les vérifications de résultat final.
+function isExoPlayableUrl(url) {
+    return isDirectVideoUrl(url);
+}
+
+/**
+ * Résout un stream candidat en flux jouable ExoPlayer.
+ * - URL déjà directe → conservée telle quelle (zéro requête réseau)
+ * - Sinon → resolveStream avec timeout court (8s) et garantie Referer/Origin
+ */
 async function resolveForExo(stream) {
     let resolved = null;
-    if (isExoPlayableUrl(stream.url)) {
-        resolved = { ...stream, isDirect: true };
+    if (isDirectVideoUrl(stream.url)) {
+        // Vérifié en live : les chemins /hls2/ de fsvid/vidzy/uqload répondent
+        // 200 avec Referer du site → pas besoin de resolveStream.
+        const origin = getUrlOrigin(stream.url, SITE_ORIGIN);
+        resolved = {
+            ...stream,
+            isDirect: true,
+            type: stream.type || (stream.url.toLowerCase().includes('.m3u8') || stream.url.toLowerCase().includes('/hls') ? 'hls' : undefined),
+            headers: { ...(stream.headers || {}), Referer: stream.headers?.Referer || origin + '/', Origin: stream.headers?.Origin || origin, 'User-Agent': USER_AGENT },
+        };
     } else {
         try { resolved = await withTimeout(resolveStream(stream), 8000); }
         catch (e) { console.warn(`[Movix] resolveStream timeout: ${e?.message}`); }
     }
     if (!resolved || !resolved.url || !resolved.isDirect) return null;
     if (!isExoPlayableUrl(resolved.url)) return null;
+    const ro = getUrlOrigin(resolved.url, SITE_ORIGIN);
     return {
         name: resolved.name || stream.name,
         title: resolved.title || stream.title,
         url: resolved.url,
         quality: resolved.quality || 'HD',
         isDirect: true,
-        headers: { ...resolved.headers, 'User-Agent': USER_AGENT }
+        ...(resolved.type ? { type: resolved.type } : {}),
+        // Conserver la langue (sinon l'app la classe "Unknown" dans les filtres/tri)
+        ...(resolved.language || stream.language ? { language: resolved.language || stream.language } : {}),
+        headers: { ...(resolved.headers || {}), Referer: resolved.headers?.Referer || ro + '/', Origin: resolved.headers?.Origin || ro, 'User-Agent': USER_AGENT }
     };
 }
 
@@ -177,13 +256,24 @@ function parseStreams(data, provider, isMovie, episodeNum) {
 
 function pushStream(streams, provider, server, lang, url, quality) {
     if (!url || typeof url !== 'string') return;
+    if (url.includes('[object')) return;
     const origin = getUrlOrigin(url, SITE_ORIGIN);
+    // Langue : normalisation Movix stricte (VFF/VFQ distincts, Default→MULTI).
+    // Le tag DOIT survivre jusqu'au stream final pour les filtres/tri de l'app.
+    const langTag = normalizeLangTagMovix(lang);
+    // Nom d'hôte lisible : évite des titres du type "Premium - Player" sans info.
+    let hostName = server || '';
+    if (!hostName) {
+        try {
+            hostName = new URL(url).hostname.replace(/^www\./, '').split('.')[0];
+        } catch (e) { hostName = 'Player'; }
+    }
     streams.push({
         name: 'Movix',
-        title: `[${normalizeLangTag(lang)}] ${provider} - ${server || 'Player'}`,
+        title: `[${langTag}] ${provider} - ${hostName}`,
         url,
         quality: quality || 'HD',
-        language: normalizeLangTag(lang),
+        language: langTag,
         headers: { Referer: origin + '/', Origin: origin, 'User-Agent': USER_AGENT }
     });
 }
@@ -226,7 +316,16 @@ async function searchFallback(baseUrl, tmdbId, mediaType, season, episode) {
         // c'est `tmdb_id` qu'il faut utiliser pour /api/fstream. Vérifié en live :
         //   /api/fstream/movie/72462 → error "Aucun contenu trouvé"
         //   /api/fstream/movie/27205 → OK (Inception)
-        for (const result of results.slice(0, 5)) {
+        // Filtrer d'abord les candidats du bon type (évite de sonder des films
+        // quand on cherche une série — l'API renvoie tout confondu).
+        const wantedType = mediaType === 'movie' ? 'movie' : 'tv';
+        const candidates = results.filter(r => {
+            let rt = r.media_type || r.type || '';
+            if (rt === 'series' || rt === 'show') rt = 'tv';
+            return rt === wantedType || !rt;
+        });
+        const ordered = (candidates.length > 0 ? candidates : results).slice(0, 6);
+        for (const result of ordered) {
             const altId = result.tmdb_id || result.id;
             if (!altId) continue;
             if (String(altId) === String(tmdbId)) continue; // déjà essayé
@@ -239,6 +338,7 @@ async function searchFallback(baseUrl, tmdbId, mediaType, season, episode) {
 
             console.log(`[Movix] Trying TMDB ${altId} (${resultType})...`);
 
+            // NB: le champ `id` des résultats est l'ID interne Movix (pas un TMDB id)
             const path = resultType === 'movie'
                 ? `${baseUrl}/api/fstream/movie/${altId}`
                 : `${baseUrl}/api/fstream/tv/${altId}/season/${Number(season) || 1}`;
@@ -277,7 +377,9 @@ async function fetchFallbackStreams(tmdbId, isMovie, season, episodeNum, signal)
                 : `${baseUrl}/api/${src.name}/tv/${tmdbId}/season/${Number(season) || 1}`;
 
             console.log(`[Movix] Trying ${src.name}...`);
-            const data = await fetchJson(path, { retries: 1 });
+            // retries: 0 — les 404 "not found (Cached)" sont définitifs (la source
+            // n'a pas le contenu) ; réessayer ne fait que doubler le délai.
+            const data = await fetchJson(path, { retries: 0 });
             if (!data || data.success === false) continue;
 
             const streams = parseStreams(data, src.name, isMovie, episodeNum);
@@ -298,42 +400,67 @@ async function fetchFallbackStreams(tmdbId, isMovie, season, episodeNum, signal)
  * OPTIMISATION: fetch synchrone en QuickJS = pas de parallélisme.
  * On résout séquentiellement avec early-exit dès qu'on a assez de streams.
  */
-async function resolveStreamsToPlayable(streams) {
+async function resolveStreamsToPlayable(streams, prefs, signal) {
     if (streams.length === 0) return [];
+
+    // Préférences utilisateur (settings) : langue + skip slow hosts
+    prefs = prefs || getPrefs();
+    const signalGuard = signal || null;
+    let candidates = filterByLanguagePref(streams, prefs.language);
+    if (prefs.skipSlowHosts) {
+        const withoutSlow = candidates.filter(s => !SLOW_HOSTS.some(h => (s.url || '').toLowerCase().includes(h)));
+        if (withoutSlow.length > 0) candidates = withoutSlow;
+    }
 
     const seen = new Set();
     const unique = [];
-    for (const s of streams) {
+    for (const s of candidates) {
         if (!seen.has(s.url)) { seen.add(s.url); unique.push(s); }
     }
     unique.sort((a, b) => streamPriority(a.url, a.language) - streamPriority(b.url, b.language));
 
-    const MAX_RESOLVE = 5;
-    const TARGET_PLAYABLE = 2; // Assez pour un VF + VOSTFR
+    // ─── Passe 1 : URLs déjà directes (zéro réseau) ───────────────────────
+    // Toujours traitées AVANT tout resolveStream. Élargit le plafond à 8 :
+    // c'est la cause n°1 des "streams indisponibles" — des flux déjà jouables
+    // restaient derrière les 2-3 premiers embeds en échec.
+    const MAX_RESOLVE = 8;      // résolutions réseau max (embeds uniquement)
+    const TARGET_PLAYABLE = 4;  // assez pour couvrir VF/VFF/VFQ + VOSTFR
     const playable = [];
     const seenPlayable = new Set();
     const startTime = Date.now();
-    const BUDGET_MS = 15000; // Budget max pour la résolution
+    const BUDGET_MS = 20000;    // budget max de la résolution
 
-    // Résolution séquentielle avec early-exit
-    // (fetch synchrone en QuickJS = Promise.allSettled ne parallélise pas)
-    const toResolve = unique.slice(0, MAX_RESOLVE);
-    for (const stream of toResolve) {
+    const addPlayable = (result) => {
+        if (result && !seenPlayable.has(result.url)) {
+            seenPlayable.add(result.url);
+            playable.push(result);
+            return true;
+        }
+        return false;
+    };
+
+    const directCandidates = unique.filter(s => isDirectVideoUrl(s.url));
+    for (const stream of directCandidates) {
         if (playable.length >= TARGET_PLAYABLE) break;
-        if (Date.now() - startTime > BUDGET_MS) break;
+        try { addPlayable(await resolveForExo(stream)); } catch (e) { /* ignore */ }
+    }
+    console.log(`[Movix] Pass 1 (direct URLs): ${playable.length} playable from ${directCandidates.length} candidate(s)`);
 
-        try {
-            const result = await resolveForExo(stream);
-            if (result && !seenPlayable.has(result.url)) {
-                seenPlayable.add(result.url);
-                playable.push(result);
+    // ─── Passe 2 : embeds → resolveStream (8s max par host) ──────────────
+    if (playable.length < TARGET_PLAYABLE && !isAborted(signalGuard)) {
+        const toResolve = unique.filter(s => !isDirectVideoUrl(s.url)).slice(0, MAX_RESOLVE);
+        for (const stream of toResolve) {
+            if (playable.length >= TARGET_PLAYABLE) break;
+            if (Date.now() - startTime > BUDGET_MS) break;
+            try {
+                addPlayable(await resolveForExo(stream));
+            } catch (e) {
+                console.warn(`[Movix] resolveStream failed: ${e?.message}`);
             }
-        } catch (e) {
-            console.warn(`[Movix] resolveStream failed: ${e?.message}`);
         }
     }
 
-    console.log(`[Movix] Total: ${unique.length} streams, ${playable.length} playable (resolved ${Math.min(toResolve.length, MAX_RESOLVE)} in ${Date.now() - startTime}ms)`);
+    console.log(`[Movix] Total: ${unique.length} streams, ${playable.length} playable (${Date.now() - startTime}ms)`);
     return playable;
 }
 
@@ -395,7 +522,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode, options
     }
 
     // ─── Résolution (dédup + tri + resolve) ───────────────────────────────
-    let playable = await resolveStreamsToPlayable(allStreams);
+    let playable = await resolveStreamsToPlayable(allStreams, getPrefs(), signal);
 
     // ─── Étape 4 : si rien de playable malgré des streams trouvés (ex: l'unique
     // embed fstream est down), retenter les sources alternatives avant d'abandonner.
@@ -405,7 +532,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode, options
         console.log('[Movix] No playable stream after resolution, trying fallback sources (wiflix/j1f/cpasmal)...');
         const fallbackStreams = await fetchFallbackStreams(tmdbId, isMovie, season, episodeNum, signal);
         if (fallbackStreams.length > 0) {
-            playable = await resolveStreamsToPlayable(fallbackStreams);
+            playable = await resolveStreamsToPlayable(fallbackStreams, getPrefs(), signal);
         }
     }
 

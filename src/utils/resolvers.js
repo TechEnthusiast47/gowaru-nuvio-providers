@@ -13,6 +13,214 @@
 export const PROVIDER_BUDGET_MS = 45000;
 
 /**
+ * Nombre maximum de streams à retourner par provider.
+ * Au-delà, on tronque pour éviter de surcharger l'UI et de gaspiller
+ * du budget sur des expandStreamQualities inutiles.
+ * NuvioTV a MAX_RESULT_ITEMS = 150 ; on garde une marge.
+ */
+export const MAX_STREAMS_PER_PROVIDER = 80;
+
+/**
+ * Limite de taille max pour le body d'une réponse HTTP (en octets).
+ * NuvioTV/NuvioMobile imposent 1 MB côté runtime. On enforce côté plugin
+ * pour éviter de parser des pages énormes (pubs, tracking) inutilement.
+ */
+const MAX_SAFE_FETCH_BODY_BYTES = 1024 * 1024; // 1 MB
+
+/**
+ * Hash de build court, injecté par build.js au moment du bundling
+ * (define esbuild : __NUVIO_BUILD_HASH__ → "abc12345").
+ * Permet de vérifier en logs quelle version du bundle tourne réellement
+ * sur l'appareil (pattern NuvioTV : sha256 du code exécuté).
+ * En dev/test (hors build.js), vaut "dev".
+ */
+const BUILD_HASH = typeof __NUVIO_BUILD_HASH__ !== 'undefined' ? __NUVIO_BUILD_HASH__ : 'dev';
+
+/** Hash de build exposé aux providers pour leurs logs de diagnostic */
+export const BUILD_ID = BUILD_HASH;
+
+// ─── Native Crypto Detection ───────────────────────────────────────────────
+// NuvioMobile expose crypto.subtle (WebCrypto: AES-GCM/CBC/ECB, HMAC, SHA-1/256/384/512)
+// via le pont natif. NuvioTV ne l'a PAS. On détecte et on expose un wrapper
+// qui utilise le natif quand disponible, sinon fallback sur CryptoJS.
+
+/**
+ * Indique si crypto.subtle est disponible (NuvioMobile uniquement).
+ * @type {boolean}
+ */
+const HAS_NATIVE_CRYPTO = typeof crypto !== 'undefined' &&
+    typeof crypto.subtle !== 'undefined';
+
+// Node.js crypto module (available in test/dev, not in QuickJS)
+let _nodeCrypto = null;
+try { _nodeCrypto = require('crypto'); } catch (_) {}
+const HAS_NODE_CRYPTO = !!_nodeCrypto;
+
+/**
+ * Wrapper natif pour SHA-256 — 10-100x plus rapide que CryptoJS en QuickJS.
+ * @param {string|Uint8Array} data - Données à hasher
+ * @returns {Promise<string>} Hash hexadécimal
+ */
+export async function sha256Hex(data) {
+    if (HAS_NATIVE_CRYPTO) {
+        const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+        const hashBuffer = await crypto.subtle.digest('SHA-256', bytes);
+        return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    if (HAS_NODE_CRYPTO) {
+        const input = typeof data === 'string' ? data : Buffer.from(data);
+        return _nodeCrypto.createHash('sha256').update(input).digest('hex');
+    }
+    // Fallback CryptoJS (QuickJS runtime)
+    return CryptoJS.SHA256(typeof data === 'string' ? data : CryptoJS.lib.WordArray.create(data)).toString();
+}
+
+/**
+ * Wrapper natif pour SHA-1.
+ */
+export async function sha1Hex(data) {
+    if (HAS_NATIVE_CRYPTO) {
+        const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+        const hashBuffer = await crypto.subtle.digest('SHA-1', bytes);
+        return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    if (HAS_NODE_CRYPTO) {
+        const input = typeof data === 'string' ? data : Buffer.from(data);
+        return _nodeCrypto.createHash('sha1').update(input).digest('hex');
+    }
+    return CryptoJS.SHA1(typeof data === 'string' ? data : CryptoJS.lib.WordArray.create(data)).toString();
+}
+
+/**
+ * Wrapper natif pour MD5 (nécessite CryptoJS — pas de MD5 natif).
+ */
+export function md5Hex(data) {
+    if (HAS_NODE_CRYPTO) {
+        const input = typeof data === 'string' ? data : Buffer.from(data);
+        return _nodeCrypto.createHash('md5').update(input).digest('hex');
+    }
+    return CryptoJS.MD5(typeof data === 'string' ? data : CryptoJS.lib.WordArray.create(data)).toString();
+}
+
+/**
+ * Wrapper natif pour HMAC-SHA256.
+ * @param {string} message - Message à signer
+ * @param {string} secret - Clé secrète
+ * @returns {Promise<string>} HMAC hexadécimal
+ */
+export async function hmacSha256Hex(message, secret) {
+    if (HAS_NATIVE_CRYPTO) {
+        const keyData = typeof secret === 'string' ? new TextEncoder().encode(secret) : secret;
+        const msgData = typeof message === 'string' ? new TextEncoder().encode(message) : message;
+        const key = await crypto.subtle.importKey('raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        const sig = await crypto.subtle.sign('HMAC', key, msgData);
+        return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    if (HAS_NODE_CRYPTO) {
+        return _nodeCrypto.createHmac('sha256', secret).update(message).digest('hex');
+    }
+    return CryptoJS.HmacSHA256(message, secret).toString();
+}
+
+/**
+ * Wrapper natif pour AES-CBC (déchiffrement).
+ * @param {string|Uint8Array} ciphertext - Données chiffrées (raw bytes ou base64)
+ * @param {string|Uint8Array} key - Clé (16/24/32 bytes)
+ * @param {string|Uint8Array} iv - Vecteur d'initialisation (16 bytes)
+ * @param {object} [opts]
+ * @param {boolean} [opts.base64Input=false] - Si true, le ciphertext est en base64
+ * @returns {Promise<Uint8Array>} Données déchiffrées
+ */
+export async function aesCbcDecrypt(ciphertext, key, iv, opts = {}) {
+    opts = opts || {};
+    if (HAS_NATIVE_CRYPTO) {
+        let ctBytes;
+        if (opts.base64Input) {
+            const b64 = typeof ciphertext === 'string' ? ciphertext : new TextDecoder().decode(ciphertext);
+            ctBytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        } else {
+            ctBytes = typeof ciphertext === 'string' ? new TextEncoder().encode(ciphertext) : ciphertext;
+        }
+        const keyBytes = typeof key === 'string' ? new TextEncoder().encode(key) : key;
+        const ivBytes = typeof iv === 'string' ? new TextEncoder().encode(iv) : iv;
+        const cryptoKey = await crypto.subtle.importKey('raw', keyBytes, 'AES-CBC', false, ['decrypt']);
+        const decrypted = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: ivBytes }, cryptoKey, ctBytes);
+        return new Uint8Array(decrypted);
+    }
+    // Fallback CryptoJS
+    const k = CryptoJS.enc.Utf8.parse(typeof key === 'string' ? key : new TextDecoder().decode(key));
+    const ivParsed = CryptoJS.enc.Utf8.parse(typeof iv === 'string' ? iv : new TextDecoder().decode(iv));
+    let ct;
+    if (opts.base64Input) {
+        ct = CryptoJS.enc.Base64.parse(typeof ciphertext === 'string' ? ciphertext : new TextDecoder().decode(ciphertext));
+    } else {
+        ct = CryptoJS.enc.Utf8.parse(typeof ciphertext === 'string' ? ciphertext : new TextDecoder().decode(ciphertext));
+    }
+    const decrypted = CryptoJS.AES.decrypt({ ciphertext: ct }, k, { iv: ivParsed, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 });
+    return Uint8Array.from(decrypted.toString(CryptoJS.enc.Latin1).split('').map(c => c.charCodeAt(0)));
+}
+
+/**
+ * Wrapper natif pour AES-ECB (déchiffrement).
+ */
+export async function aesEcbDecrypt(ciphertext, key, opts = {}) {
+    opts = opts || {};
+    // Node.js crypto module (AES-ECB not supported by WebCrypto in Node.js)
+    if (HAS_NODE_CRYPTO) {
+        try {
+            let ctBuf;
+            if (opts.base64Input) {
+                const b64 = typeof ciphertext === 'string' ? ciphertext : new TextDecoder().decode(ciphertext);
+                ctBuf = Buffer.from(b64, 'base64');
+            } else {
+                ctBuf = typeof ciphertext === 'string' ? Buffer.from(ciphertext) : Buffer.from(ciphertext);
+            }
+            const keyBuf = typeof key === 'string' ? Buffer.from(key) : Buffer.from(key);
+            const decipher = _nodeCrypto.createDecipheriv('aes-128-ecb', keyBuf, null);
+            const decrypted = Buffer.concat([decipher.update(ctBuf), decipher.final()]);
+            return new Uint8Array(decrypted);
+        } catch (_) {
+            // OpenSSL 3.x may block ECB — fall through to CryptoJS
+        }
+    }
+    // WebCrypto (NuvioMobile with crypto.subtle)
+    if (HAS_NATIVE_CRYPTO) {
+        try {
+            let ctBytes;
+            if (opts.base64Input) {
+                const b64 = typeof ciphertext === 'string' ? ciphertext : new TextDecoder().decode(ciphertext);
+                ctBytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+            } else {
+                ctBytes = typeof ciphertext === 'string' ? new TextEncoder().encode(ciphertext) : ciphertext;
+            }
+            const keyBytes = typeof key === 'string' ? new TextEncoder().encode(key) : key;
+            const cryptoKey = await crypto.subtle.importKey('raw', keyBytes, 'AES-ECB', false, ['decrypt']);
+            const decrypted = await crypto.subtle.decrypt({ name: 'AES-ECB' }, cryptoKey, ctBytes);
+            return new Uint8Array(decrypted);
+        } catch (_) {
+            // WebCrypto may not support ECB — fall through to CryptoJS
+        }
+    }
+    // Fallback CryptoJS (QuickJS runtime)
+    const k = CryptoJS.enc.Utf8.parse(typeof key === 'string' ? key : new TextDecoder().decode(key));
+    let ct;
+    if (opts.base64Input) {
+        ct = CryptoJS.enc.Base64.parse(typeof ciphertext === 'string' ? ciphertext : new TextDecoder().decode(ciphertext));
+    } else {
+        ct = CryptoJS.enc.Utf8.parse(typeof ciphertext === 'string' ? ciphertext : new TextDecoder().decode(ciphertext));
+    }
+    const decrypted = CryptoJS.AES.decrypt({ ciphertext: ct }, k, { mode: CryptoJS.mode.ECB, padding: CryptoJS.pad.Pkcs7 });
+    return Uint8Array.from(decrypted.toString(CryptoJS.enc.Latin1).split('').map(c => c.charCodeAt(0)));
+}
+
+/**
+ * Indique si crypto.subtle est disponible (pour les providers qui veulent
+ * utiliser des API WebCrypto avancées comme AES-GCM, PBKDF2, etc.).
+ * @type {boolean}
+ */
+export const nativeCryptoAvailable = HAS_NATIVE_CRYPTO;
+
+/**
  * Delais de retry standards (ms)
  */
 const RETRY_DELAYS = [1000, 3000, 5000];
@@ -105,6 +313,76 @@ export async function fetchWithRetry(fetchFn, opts = {}) {
 }
 
 /**
+ * Exécute un ensemble de tâches en parallèle avec une limite de concurrence.
+ * Évite de créer 50 requêtes simultanées qui dépassent les limites du runtime
+ * ou fatiguent les serveurs cible.
+ *
+ * @template T
+ * @param {Array<{url: string, opts?: object}>} requests - Liste de requêtes à effectuer
+ * @param {Function} fetchFn - Fonction de fetch (ex: (url, opts) => safeFetch(url, opts))
+ * @param {object} [opts]
+ * @param {number} [opts.concurrency=5] - Nombre max de requêtes simultanées
+ * @param {boolean} [opts.stopOnFirst=false] - Arrêter dès qu'une requête réussit
+ *   (les fetchs déjà en vol s'achèvent — QuickJS ne permet pas de les annuler)
+ * @param {number} [opts.staggerMs=0] - Espacement minimal entre les DÉBUTS de
+ *   requêtes (ms), tous workers confondus. Évite le "thundering herd" vers
+ *   des domaines protégés par Cloudflare (pattern NuvioTV : index * 60ms
+ *   entre chaque scraper). 0 = aucune espacement (burst autorisé).
+ * @returns {Promise<Array<{url: string, result: object|null, error: Error|null}>>}
+ */
+export async function fetchBatch(requests, fetchFn, opts = {}) {
+  const concurrency = opts.concurrency ?? 5;
+  const stopOnFirst = opts.stopOnFirst ?? false;
+  const staggerMs = opts.staggerMs ?? 0;
+  const results = new Array(requests.length).fill(null);
+  let completedCount = 0;
+  let firstSuccess = null;
+  let idx = 0;
+  let lastStart = 0; // Date de début de la dernière requête lancée
+
+  async function runNext() {
+    while (idx < requests.length) {
+      // stopOnFirst : arrêter de piocher de nouvelles requêtes dès qu'un
+      // succès est enregistré (les requêtes déjà en vol s'achèvent)
+      if (stopOnFirst && firstSuccess) break;
+
+      // Stagger : espacer les départs de requêtes (anti-burst Cloudflare).
+      // Boucle car lastStart peut être mis à jour par un autre worker
+      // pendant notre attente.
+      while (staggerMs > 0) {
+        const wait = lastStart + staggerMs - Date.now();
+        if (wait <= 0) break;
+        await sleep(wait);
+      }
+
+      const i = idx++;
+      lastStart = Date.now();
+      const { url, opts: reqOpts } = requests[i];
+      try {
+        const result = await fetchFn(url, reqOpts);
+        results[i] = { url, result, error: null };
+        completedCount++;
+        if (stopOnFirst && result && !firstSuccess) {
+          firstSuccess = result;
+        }
+      } catch (err) {
+        results[i] = { url, result: null, error: err };
+        completedCount++;
+      }
+    }
+  }
+
+  // Lancer les workers
+  const workers = [];
+  for (let w = 0; w < Math.min(concurrency, requests.length); w++) {
+    workers.push(runNext());
+  }
+  await Promise.allSettled(workers);
+
+  return results;
+}
+
+/**
  * Trie les streams pour mettre VF en premier, puis VOSTFR.
  * @param {Array} streams
  * @returns {Array}
@@ -146,6 +424,7 @@ export function safeJson(data) {
 export function createProvider(name, extractFn, opts = {}) {
   const PROVIDER_TIMEOUT = safeConfig(`NUVIO_TIMEOUT_${name.toUpperCase().replace(/[^a-z0-9]/g, '_')}`, opts.timeout || PROVIDER_BUDGET_MS);
   const qualityOpts = opts.quality || { includeCodec: true, includeFps: false };
+  const maxStreams = opts.maxStreams || MAX_STREAMS_PER_PROVIDER;
 
   return async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
     const se = mediaType === 'movie' ? '' : ` S${season}E${episode}`;
@@ -154,15 +433,47 @@ export function createProvider(name, extractFn, opts = {}) {
     const { signal } = setupAbortSignal(externalSignal);
     if (isAborted(signal)) return [];
 
-    console.log(`[${name}] Request: ${label}`);
+    const startTime = Date.now();
+    console.log(`[${name}] Request: ${label} (build ${BUILD_HASH})`);
 
     try {
-      const streams = await withTimeout(
+      const rawStreams = await withTimeout(
         extractFn(tmdbId, mediaType, season, episode, { signal }),
         PROVIDER_TIMEOUT,
         label
       );
-      return await expandStreamQualities(streams, qualityOpts);
+
+      // Dédup par URL+langue AVANT troncature : NuvioTV dédup aussi côté app
+      // (distinctBy url, MAX_RESULT_ITEMS=150 global) — chaque doublon émis
+      // gaspille un slot pour les autres providers. Clé identique à
+      // expandStreamQualities (URL + langue RAW) pour préserver VF/VOSTFR
+      // quand la même URL sert aux deux. Filtre aussi les url vides ou
+      // "[object ...]" (rejetées silencieusement côté app).
+      const rawList = Array.isArray(rawStreams) ? rawStreams : [];
+      const seenUrls = new Set();
+      const dedupedRaw = [];
+      for (const s of rawList) {
+        if (!s) continue;
+        const u = s.url;
+        if (typeof u === 'string') {
+          if (!u || u.includes('[object')) continue;
+          const dedupKey = `${u}|${String(s.language || '').toUpperCase()}`;
+          if (seenUrls.has(dedupKey)) continue;
+          seenUrls.add(dedupKey);
+        }
+        dedupedRaw.push(s);
+      }
+
+      // Tronquer les résultats bruts avant expandStreamQualities
+      // pour éviter de parser des HLS manifests inutiles.
+      const truncated = dedupedRaw.slice(0, maxStreams * 2);
+      const expanded = await expandStreamQualities(truncated, qualityOpts);
+
+      const elapsed = Date.now() - startTime;
+      console.log(`[${name}] Done: ${expanded.length} streams in ${elapsed}ms`);
+
+      // Tronquer les résultats finaux
+      return expanded.slice(0, maxStreams);
     } catch (error) {
       if (error && error.message && error.message.includes('[Timeout]')) {
         console.warn(`[${name}] ${error.message}`);
@@ -174,6 +485,47 @@ export function createProvider(name, extractFn, opts = {}) {
       return [];
     }
   };
+}
+
+// ─── Plugin Settings (NuvioMobile / NuvioTV) ───────────────────────────────
+// Les deux apps injectent globalThis.SCRAPER_SETTINGS (paramètres sauvegardés
+// par l'utilisateur). NuvioMobile affiche en plus une UI de réglages en
+// appelant module.exports.onSettings() (layout: header/info/text/select/toggle).
+// NuvioTV n'a pas d'UI mais injecte aussi les réglages. Tout est optionnel :
+// sans onSettings exporté, aucun impact sur l'app.
+
+/**
+ * Retourne les réglages du scraper injectés par l'app ({} par défaut).
+ * @returns {object}
+ */
+export function getScraperSettings() {
+  try {
+    if (typeof globalThis !== 'undefined' && globalThis.SCRAPER_SETTINGS &&
+        typeof globalThis.SCRAPER_SETTINGS === 'object') {
+      return globalThis.SCRAPER_SETTINGS;
+    }
+  } catch (e) {}
+  return {};
+}
+
+/**
+ * Helper standard pour déclarer un layout de réglages (hook onSettings).
+ * Usage dans index.js :
+ *   module.exports = {
+ *     getStreams: createProvider('X', extractStreams),
+ *     onSettings: createSettingsLayout([...]),
+ *   };
+ *
+ * Types supportés par l'UI NuvioMobile : header, info, text (isPassword,
+ * placeholder), select (options[{label,value}], defaultValue), toggle
+ * (defaultValue). Champs communs : key, label, description.
+ *
+ * @param {Array} items - Layout des réglages
+ * @returns {Function} onSettings() → Promise<Array>
+ */
+export function createSettingsLayout(items) {
+  const layout = Array.isArray(items) ? items : [];
+  return async function onSettings() { return layout; }; 
 }
 
 /**
@@ -881,7 +1233,16 @@ export async function safeFetch(url, options = {}) {
         const status = response.status;
         let bodyText = '';
         try {
-            bodyText = await response.text();
+            // Lecture avec garde taille : si la réponse dépasse 1 MB,
+            // on tronque pour éviter d'exploser la mémoire QuickJS.
+            // (NuvioTV/NuvioMobile imposent 1 MB côté natif)
+            const rawText = await response.text();
+            if (rawText && rawText.length > MAX_SAFE_FETCH_BODY_BYTES) {
+                console.warn(`[safeFetch] Response truncated (${rawText.length} bytes > ${MAX_SAFE_FETCH_BODY_BYTES}): ${(url || '').slice(0, 100)}`);
+                bodyText = rawText.slice(0, MAX_SAFE_FETCH_BODY_BYTES);
+            } else {
+                bodyText = rawText || '';
+            }
         } catch (e) {
             bodyText = '';
         }
