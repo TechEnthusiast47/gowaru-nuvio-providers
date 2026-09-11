@@ -34,12 +34,85 @@ async function getImdbId(tmdbId, mediaType) {
   return null;
 }
 
+/**
+ * Referme un JSON tronqué à l'index donné, en équilibrant les crochets/acco-
+ * lades encore ouverts (les chaînes sont ignorées).
+ */
+function closeTruncatedJson(text, endIndex) {
+  const slice = text.slice(0, endIndex + 1);
+  const stack = [];
+  let inStr = false;
+  for (let i = 0; i < slice.length; i++) {
+    const c = slice[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '[') stack.push(']');
+    else if (c === '{') stack.push('}');
+    else if (c === ']' || c === '}') stack.pop();
+  }
+  let out = slice;
+  while (stack.length) out += stack.pop();
+  return out;
+}
+
+/**
+ * Parse un JSON potentiellement tronqué par la limite runtime (1 Mo).
+ * Indispensable pour les très longues séries : le meta cinemeta de One Piece
+ * fait ~1,36 Mo, donc JSON.parse échoue et l'ArmSync était totalement inopé-
+ * rant (épisodes absolus indisponibles → mauvais épisode servi).
+ */
+function parseMaybeTruncatedJson(text) {
+  if (!text) return null;
+  try { return JSON.parse(text); } catch (e) { /* réponse tronquée */ }
+  for (let end = text.lastIndexOf('}'); end > 0; end = text.lastIndexOf('}', end - 1)) {
+    try { return JSON.parse(closeTruncatedJson(text, end)); } catch (e) { continue; }
+  }
+  return null;
+}
+
+/**
+ * Épisode absolu via la structure saisonnière TMDB (autorité sur la
+ * numérotation envoyée par l'app, qui vient de TMDB).
+ *
+ * cinemeta regroupe les anime par arcs à la TVDB : pour One Piece, son « S2E1 »
+ * vaut l'épisode 9 alors que TMDB (et les sites FR) le numérotent 62. Utiliser
+ * cinemeta produisait donc systématiquement le mauvais épisode sur les longues
+ * séries.
+ */
+async function getAbsoluteEpisodeFromTmdb(tmdbId, season, episode) {
+  const targetSeason = parseInt(season, 10);
+  const targetEpisode = parseInt(episode, 10);
+  if (!tmdbId || !targetSeason || targetSeason <= 0) return null;
+
+  const res = await syncFetch(`${TMDB_API_BASE}/tv/${tmdbId}?api_key=${TMDB_API_KEY}&language=en-US`);
+  if (!res) return null;
+  const data = parseMaybeTruncatedJson(await res.text());
+  const seasons = data && Array.isArray(data.seasons) ? data.seasons : null;
+  if (!seasons) return null;
+
+  let total = 0;
+  for (const s of seasons) {
+    const n = parseInt(s && s.season_number, 10);
+    if (!isFinite(n) || n <= 0) continue; // saison 0 = spéciaux
+    if (n === targetSeason) {
+      const absolute = total + targetEpisode;
+      console.log(`[ArmSync] TMDB: S${targetSeason}E${targetEpisode} -> Absolute ${absolute}`);
+      return absolute;
+    }
+    if (n < targetSeason) total += parseInt(s.episode_count, 10) || 0;
+  }
+  return null;
+}
+
 async function getAbsoluteEpisode(imdbId, season, episode) {
   if (!imdbId || season === 0) return null;
   const res = await syncFetch(`${CINEMATA_API}/meta/series/${imdbId}.json`);
   if (!res) return null;
-  const json = await res.json();
-  const data = json != null ? json : {};
+  const data = parseMaybeTruncatedJson(await res.text()) || {};
   if (!data?.meta?.videos) return null;
   const episodes = data.meta.videos
     .filter(v => v.season > 0 && v.episode > 0)
