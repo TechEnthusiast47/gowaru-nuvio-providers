@@ -1,6 +1,6 @@
 /**
  * animevost-fr - Built from src/animevost-fr/
- * Generated: 2026-09-10T22:03:02.618782567Z
+ * Generated: 2026-09-11T02:26:55.092615034Z
  */
 var __provider = (() => {
   var __defProp = Object.defineProperty;
@@ -243,7 +243,14 @@ var __provider = (() => {
       const start = Date.now();
       const SLOW_THRESHOLD = 15e3;
       const method = (options.method || "GET").toUpperCase();
-      const cacheKey = method + "|" + url;
+      let headerTag = "";
+      if (options.headers && typeof options.headers === "object") {
+        const keys = Object.keys(options.headers).sort();
+        if (keys.length) {
+          headerTag = "|" + keys.map((k) => `${k.toLowerCase()}=${String(options.headers[k]).slice(0, 80)}`).join("&");
+        }
+      }
+      const cacheKey = method + "|" + url + headerTag;
       if (method === "GET") {
         const cached = getCachedFetch(cacheKey);
         if (cached) {

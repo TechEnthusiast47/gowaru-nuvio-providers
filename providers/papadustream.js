@@ -1,6 +1,6 @@
 /**
  * papadustream - Built from src/papadustream/
- * Generated: 2026-09-10T22:03:03.190783178Z
+ * Generated: 2026-09-11T02:26:55.8116158Z
  */
 var __provider = (() => {
   var __create = Object.create;
@@ -556,7 +556,14 @@ var __provider = (() => {
       const start = Date.now();
       const SLOW_THRESHOLD = 15e3;
       const method = (options.method || "GET").toUpperCase();
-      const cacheKey = method + "|" + url;
+      let headerTag = "";
+      if (options.headers && typeof options.headers === "object") {
+        const keys = Object.keys(options.headers).sort();
+        if (keys.length) {
+          headerTag = "|" + keys.map((k) => `${k.toLowerCase()}=${String(options.headers[k]).slice(0, 80)}`).join("&");
+        }
+      }
+      const cacheKey = method + "|" + url + headerTag;
       if (method === "GET") {
         const cached = getCachedFetch(cacheKey);
         if (cached) {
@@ -668,7 +675,7 @@ var __provider = (() => {
       PROVIDER_BUDGET_MS = 45e3;
       MAX_STREAMS_PER_PROVIDER = 80;
       MAX_SAFE_FETCH_BODY_BYTES = 1024 * 1024;
-      BUILD_HASH = true ? "41210d4f" : "dev";
+      BUILD_HASH = true ? "3344d314" : "dev";
       HAS_NATIVE_CRYPTO = typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
       _nodeCrypto = null;
       try {
@@ -12810,10 +12817,11 @@ var __provider = (() => {
   });
 
   // src/papadustream/extractor.js
-  function getImdbIdFromTmdb(tmdbId) {
+  function getImdbIdFromTmdb(tmdbId, isMovie) {
     return __async(this, null, function* () {
-      const url = `${TMDB_API_BASE}/tv/${tmdbId}/external_ids?api_key=${TMDB_API_KEY}`;
-      return withCache(`imdb_${tmdbId}`, () => __async(null, null, function* () {
+      const kind = isMovie ? "movie" : "tv";
+      const url = `${TMDB_API_BASE}/${kind}/${tmdbId}/external_ids?api_key=${TMDB_API_KEY}`;
+      return withCache(`imdb_${kind}_${tmdbId}`, () => __async(null, null, function* () {
         try {
           const res = yield safeFetch(url);
           if (!res) return null;
@@ -12830,16 +12838,17 @@ var __provider = (() => {
       }));
     });
   }
-  function getTmdbSeriesTitle(tmdbId) {
+  function getTmdbTitle(tmdbId, isMovie) {
     return __async(this, null, function* () {
-      const url = `${TMDB_API_BASE}/tv/${tmdbId}?api_key=${TMDB_API_KEY}&language=fr-FR`;
-      return withCache(`title_${tmdbId}`, () => __async(null, null, function* () {
+      const kind = isMovie ? "movie" : "tv";
+      const url = `${TMDB_API_BASE}/${kind}/${tmdbId}?api_key=${TMDB_API_KEY}&language=fr-FR`;
+      return withCache(`title_${kind}_${tmdbId}`, () => __async(null, null, function* () {
         try {
           const res = yield safeFetch(url);
           if (!res) return null;
           const data = yield res.json();
           if (!data || data.success === false) return null;
-          return data.name || null;
+          return data.name || data.title || null;
         } catch (e) {
           console.warn(`[Papadustream] TMDB title error: ${e == null ? void 0 : e.message}`);
           return null;
@@ -12847,17 +12856,18 @@ var __provider = (() => {
       }));
     });
   }
-  function searchSeriesByTitle(title) {
+  function searchSiteByTitle(title, isMovie) {
     return __async(this, null, function* () {
       const searchUrl = `${BASE_URL}/search?q=${encodeURIComponent(title)}`;
-      return withCache(`search_${title.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`, () => __async(null, null, function* () {
+      const kind = isMovie ? "films" : "series";
+      return withCache(`search_${kind}_${title.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`, () => __async(null, null, function* () {
         try {
           const html = yield fetchText(searchUrl);
           if (!html) return null;
-          const seriesRegex = /\/series\/(tt\d+)/g;
+          const siteRegex = new RegExp(`\\/${kind}\\/(tt\\d+)`, "g");
           let match;
           const found = [];
-          while ((match = seriesRegex.exec(html)) !== null) {
+          while ((match = siteRegex.exec(html)) !== null) {
             found.push(match[1]);
           }
           if (found.length > 0) {
@@ -12865,7 +12875,7 @@ var __provider = (() => {
             console.log(`[Papadustream] Search "${title}" \u2192 ${imdbId} (${found.length} results)`);
             return imdbId;
           }
-          console.warn(`[Papadustream] No series found for "${title}"`);
+          console.warn(`[Papadustream] No results for "${title}"`);
           return null;
         } catch (e) {
           console.warn(`[Papadustream] Search error: ${e == null ? void 0 : e.message}`);
@@ -12874,17 +12884,17 @@ var __provider = (() => {
       }));
     });
   }
-  function resolveImdbId(tmdbId) {
+  function resolveImdbId(tmdbId, isMovie) {
     return __async(this, null, function* () {
-      let imdbId = yield getImdbIdFromTmdb(tmdbId);
+      let imdbId = yield getImdbIdFromTmdb(tmdbId, isMovie);
       if (imdbId) return imdbId;
       console.log(`[Papadustream] Title search fallback for TMDB ${tmdbId}...`);
-      const title = yield getTmdbSeriesTitle(tmdbId);
+      const title = yield getTmdbTitle(tmdbId, isMovie);
       if (title) {
         const mainTitle = title.split(":")[0].trim();
-        imdbId = yield searchSeriesByTitle(mainTitle);
+        imdbId = yield searchSiteByTitle(mainTitle, isMovie);
         if (imdbId) return imdbId;
-        imdbId = yield searchSeriesByTitle(title);
+        imdbId = yield searchSiteByTitle(title, isMovie);
         if (imdbId) return imdbId;
       }
       console.warn(`[Papadustream] IMDb ID not found for TMDB ${tmdbId}`);
@@ -12912,25 +12922,31 @@ var __provider = (() => {
       const signal = (options == null ? void 0 : options.signal) || null;
       if (isAborted(signal)) return [];
       setCurrentSignal(signal);
-      if (mediaType !== "tv") {
-        console.log(`[Papadustream] Unsupported: ${mediaType} (TV series only)`);
+      const isTv = mediaType === "series" || mediaType === "tv";
+      const isMovie = mediaType === "movie";
+      if (!isTv && !isMovie) {
+        console.log(`[Papadustream] Unsupported: ${mediaType} (TV/movies only)`);
         return [];
       }
       const startTime = Date.now();
       console.log(`[Papadustream] Looking for S${season || 1}E${episode || 1} (TMDB: ${tmdbId})`);
-      const imdbId = yield resolveImdbId(tmdbId);
+      const imdbId = yield resolveImdbId(tmdbId, isMovie);
       if (!imdbId) {
         console.warn(`[Papadustream] Could not resolve IMDb ID for TMDB ${tmdbId}`);
         return [];
       }
-      const targetEpisodes = yield resolveTargetEpisodes(tmdbId, mediaType, season, episode, {
-        startTime,
-        budgetMs: 45e3
-      });
-      console.log(`[Papadustream] Target episodes: ${targetEpisodes}`);
-      const seriesUrl = `${BASE_URL}/series/${imdbId}`;
-      let html = yield withCache(`page_${imdbId}`, () => __async(null, null, function* () {
-        return yield fetchText(seriesUrl);
+      let targetEpisodes = [1];
+      if (isTv) {
+        targetEpisodes = yield resolveTargetEpisodes(tmdbId, "tv", season, episode, {
+          startTime,
+          budgetMs: 45e3
+        });
+        console.log(`[Papadustream] Target episodes: ${targetEpisodes}`);
+      }
+      const pagePath = isMovie ? `/films/${imdbId}` : `/series/${imdbId}`;
+      const pageUrl = `${BASE_URL}${pagePath}`;
+      let html = yield withCache(`page_${imdbId}_${isMovie ? "mv" : "tv"}`, () => __async(null, null, function* () {
+        return yield fetchText(pageUrl);
       }));
       if (!html) {
         console.warn(`[Papadustream] Series page not accessible: ${seriesUrl}`);
@@ -12938,7 +12954,7 @@ var __provider = (() => {
       }
       if (!html.includes("/hls/") || !html.includes("playlist.m3u8")) {
         console.warn(`[Papadustream] Page has no HLS content (${html.length} bytes), retrying...`);
-        const retryHtml = yield fetchText(seriesUrl);
+        const retryHtml = yield fetchText(pageUrl);
         if (retryHtml && retryHtml.includes("playlist.m3u8")) {
           html = retryHtml;
         } else {
@@ -12948,21 +12964,38 @@ var __provider = (() => {
       const targetSeason = Number(season) || 1;
       const streams = [];
       const seenUrls = /* @__PURE__ */ new Set();
-      for (const ep of targetEpisodes) {
-        const urls = extractHlsUrls(html, targetSeason, ep);
-        for (const url of urls) {
-          if (seenUrls.has(url)) continue;
-          seenUrls.add(url);
+      if (isMovie) {
+        const movieRe = new RegExp(`\\/hls\\/s\\d+\\/movie\\/${imdbId}\\/playlist\\.m3u8`, "g");
+        const m = movieRe.exec(html);
+        if (m) {
+          const url = `${BASE_URL}${m[0]}`;
           const stream = toStream(url, "VF", "Papadustream", BASE_URL, {
             quality: "HD",
-            title: `S${targetSeason}E${ep} HLS`
+            title: "HLS"
           });
           stream.type = "hls";
           streams.push(stream);
+          console.log(`[Papadustream] Movie HLS found`);
+        } else {
+          console.log(`[Papadustream] No movie HLS for ${imdbId}`);
         }
-        if (streams.length > 0) break;
+      } else {
+        for (const ep of targetEpisodes) {
+          const urls = extractHlsUrls(html, targetSeason, ep);
+          for (const url of urls) {
+            if (seenUrls.has(url)) continue;
+            seenUrls.add(url);
+            const stream = toStream(url, "VF", "Papadustream", BASE_URL, {
+              quality: "HD",
+              title: `S${targetSeason}E${ep} HLS`
+            });
+            stream.type = "hls";
+            streams.push(stream);
+          }
+          if (streams.length > 0) break;
+        }
       }
-      if (streams.length === 0 && targetEpisodes[0] > 1) {
+      if (isTv && streams.length === 0 && targetEpisodes[0] > 1) {
         const prevEp = targetEpisodes[0] - 1;
         const urls = extractHlsUrls(html, targetSeason, prevEp);
         for (const url of urls) {
@@ -12980,7 +13013,7 @@ var __provider = (() => {
         }
       }
       if (streams.length === 0) {
-        console.log(`[Papadustream] No HLS for ${imdbId} S${targetSeason}E${targetEpisodes[0]}`);
+        console.log(`[Papadustream] No HLS for ${imdbId}${isTv ? ` S${targetSeason}E${targetEpisodes[0]}` : ""}`);
       } else {
         console.log(`[Papadustream] ${streams.length} stream(s) found`);
       }

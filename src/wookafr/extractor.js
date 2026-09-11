@@ -6,6 +6,7 @@ import { toStream, toSlug, normalize, resolveTargetEpisodes, stripSeasonSuffix, 
 import {
   SITE, SELECTORS, PATTERNS, TIMEOUTS, SCORES,
   LANGUAGE_MAP, ANIME_GENRE_ID, ANIME_KEYWORDS,
+  LECTEURVIDEO_LANG_SECTIONS, LECTEURVIDEO_KNOWN_HOSTS,
   MAX_CANDIDATES, MAX_SEARCH_TITLES,
   CACHE_NAMESPACE, CACHE_TAG,
 } from './config.js'
@@ -44,8 +45,6 @@ function scoreMatch(resultTitle, searchTitle) {
   if (words.length > 0) {
     // Anti-false-positive: si la recherche a ≥2 mots significatifs mais que
     // le résultat en partage < 2, c'est probablement une série différente
-    // Ex: "Law & Order" → mots=["law","order"] cherche "Police in a Pod" → matched=0 → reject
-    // Ex: "One Piece" → mots=["one","piece"] cherche "One Piece Saison 2" → matched=2 → OK
     if (words.length >= 2 && matched < 2) return 0
     return Math.round((matched / words.length) * 50)
   }
@@ -81,13 +80,29 @@ function extractNonce(html) {
   return m ? m[2] : null
 }
 
+// ─── TV-safe DOM helpers ────────────────────────────────────────────────────
+// Le polyfill cheerio de NuvioTV n'a ni .hasClass() ni .closest() ni
+// .parent() fonctionnel — feature-détecter ou parser en texte brut.
+
+function safeHasClass($el, cls) {
+  try {
+    if (typeof $el.hasClass === 'function') return $el.hasClass(cls)
+  } catch (_) {}
+  // Fallback texte brut : attribut class de l'élément source
+  try {
+    const raw = $el && $el.length ? ($el[0] && $el[0].attribs && $el[0].attribs.class) || '' : ''
+    return raw.split(/\s+/).includes(cls)
+  } catch (_) {}
+  return false
+}
+
 function parseSeasons(html) {
   const $ = cheerio.load(html)
   const seasons = []
   $(SELECTORS.SEASON_BUTTON).each((_, el) => {
     const id = $(el).attr('data-season')
     const title = $(el).text().trim()
-    const isActive = $(el).hasClass('active')
+    const isActive = safeHasClass($(el), 'active')
     if (id) seasons.push({ id, title, isActive })
   })
   return seasons
@@ -130,10 +145,124 @@ function extractIframeUrl(html) {
   return src || null
 }
 
+// ─── lecteurvideo.com : parsing par sections de langue ─────────────────────
+// L'embed classe ses serveurs dans des div class="OD OD_XX" (FR/VFF/VFQ/
+// VOSTFR/EN…) avec les URLs en base64 dans onclick="showVideo('...')".
+// L'onglet "Télécharger" (OD_down) contient des liens megaup/1fichier souvent
+// morts (megaup 404 vérifié en live) — exclu de la sélection principale.
+
+function decodeB64Url(token) {
+  if (!token) return null
+  try {
+    let s = String(token).trim().replace(/-/g, '+').replace(/_/g, '/')
+    while (s.length % 4) s += '='
+    let decoded = ''
+    if (typeof atob === 'function') {
+      decoded = atob(s)
+    } else {
+      return null
+    }
+    if (!/^https?:\/\//i.test(decoded)) return null
+    return decoded
+  } catch (_) { return null }
+}
+
+/**
+ * Extrait TOUS les serveurs de toutes les sections de langue de l'embed
+ * lecteurvideo.com. Retourne une liste de candidats :
+ * { url, langTag, langLabel, host, priority }
+ * - langue FR d'abord (VF > VFF > VFQ > VOSTFR > VO), serveur rapide ensuite
+ * - onglet Télécharger ignoré (hosts morts/lents vérifiés)
+ */
+export function parseLecteurVideoServers(embedHtml) {
+  const html = String(embedHtml || '')
+  if (!html) return []
+
+  const candidates = []
+  // Découper par sections de langue : <div class="OD OD_FR ..."> ... </div>
+  // (l'ordre du HTML place chaque section avant la suivante)
+  const sectionRe = /class="OD\s+OD_([A-Za-z]+)[^"]*"/g
+  const sections = []
+  let m
+  while ((m = sectionRe.exec(html)) !== null) {
+    sections.push({ lang: m[1].toUpperCase(), start: m.index })
+  }
+  // Bornes de fin = début de la section suivante
+  for (let i = 0; i < sections.length; i++) {
+    sections[i].end = i + 1 < sections.length ? sections[i + 1].start : html.length
+  }
+
+  const LANG_ORDER = { VF: 0, VFF: 1, VFQ: 2, VOSTFR: 3, VO: 4, EN: 4 }
+  const KNOWN = LECTEURVIDEO_KNOWN_HOSTS
+
+  for (const sec of sections) {
+    const langTag = LECTEURVIDEO_LANG_SECTIONS[sec.lang]
+    // OD_down = onglet Télécharger → ignoré (megaup/1fichier morts ou lents)
+    if (!langTag) continue
+    const chunk = html.slice(sec.start, sec.end)
+    let sm
+    // showVideo('BASE64') — parfois avec un 2e argument (qualité/priorité)
+    const svRe = /showVideo\(\s*['"]([A-Za-z0-9+/=_-]+)['"]\s*(?:,\s*['"]?(\d+)['"]?)?\s*\)/g
+    while ((sm = svRe.exec(chunk)) !== null) {
+      const url = decodeB64Url(sm[1])
+      if (!url) continue
+      const lower = url.toLowerCase()
+      // Filtrer : hosts connus uniquement, pas d'images/pubs
+      if (!KNOWN.some(k => lower.includes(k))) continue
+      if (/\.(png|jpe?g|gif|webp|css|js)(\?|$)/i.test(lower)) continue
+      // Priorité serveur : les embeds rapides d'abord (résolus en direct par
+      // resolveStream via leurs résolveurs spécifiques uqload/vidmoly/veev…)
+      let priority = 50
+      if (lower.includes('uqload')) priority = 10
+      else if (lower.includes('vidmoly')) priority = 12
+      else if (lower.includes('veev.')) priority = 15
+      else if (lower.includes('waaw.')) priority = 16
+      else if (lower.includes('filemoon')) priority = 20
+      else if (lower.includes('voe.')) priority = 22
+      else if (lower.includes('emmmmbed')) priority = 25
+      else if (lower.includes('coflix') || lower.includes('upn.one')) priority = 30
+      else if (lower.includes('wishonly')) priority = 40
+      candidates.push({
+        url,
+        langTag,
+        host: (url.match(/^https?:\/\/([^/]+)/) || [])[1] || 'lecteurvideo',
+        priority,
+        secLang: sec.lang,
+      })
+    }
+  }
+
+  // Dédup par URL (un serveur peut apparaître 2x dans une section)
+  const seen = new Set()
+  const deduped = []
+  for (const c of candidates.sort((a, b) => a.priority - b.priority)) {
+    if (seen.has(c.url)) continue
+    seen.add(c.url)
+    deduped.push(c)
+  }
+  return deduped
+}
+
+/**
+ * Ancien format : l'embed n'a pas de sections OD_* → retomber sur
+ * l'extraction d'iframe classique depuis la page.
+ */
+function extractDirectLinksFromEmbed(embedHtml) {
+  const links = []
+  const html = String(embedHtml || '')
+  // .mp4/.m3u8 directs
+  const directRe = /["'](https?:\/\/[^"']+?\.(?:m3u8|mp4)[^"']*)["']/gi
+  let m
+  while ((m = directRe.exec(html)) !== null) {
+    links.push({ url: m[1], langTag: 'VF', host: 'direct' })
+  }
+  return links
+}
+
 function detectLanguage(url, html) {
   const u = url.toLowerCase()
   if (u.includes('vostfr') || u.includes('vost')) return 'VOSTFR'
-  if (u.includes('vf') || u.includes('french')) return 'VF'
+  if (u.includes('french') || /\/vf[-/.]/.test(u)) return 'VF'
   if (u.includes('vo') || u.includes('english')) return 'VO'
   const $ = html ? cheerio.load(html) : null
   if ($) {
@@ -211,7 +340,7 @@ async function trySearch(titles) {
   const slugMatch = await trySlugFallback(titles[0], 'movie', undefined, titles._metadata?.year)
   if (slugMatch) { console.log(`[Wookafr] Found via slug: ${slugMatch.url}`); return slugMatch }
 
-  // Dernier recours : WP REST API
+  // Dernier recours : WP REST API (chemin correct vérifié : /wp-json/wp/v2/posts)
   console.log('[Wookafr] Trying WP API search...')
   return await searchViaWpApi(titles[0], 'movie')
 }
@@ -262,15 +391,16 @@ async function trySearchSeries(titles) {
 
 
 /**
- * Fallback : cherche via l'API REST WordPress (/wp-json/v2/posts?search=...)
+ * Fallback : cherche via l'API REST WordPress (/wp-json/wp/v2/posts?search=...)
  * pour trouver l'URL exacte quand la recherche par slug échoue.
+ * NOTE : l'ancien chemin /wp-json/v2/posts renvoyait 404 (vérifié en live).
  */
 async function searchViaWpApi(query, mediaType) {
   const searchQuery = encodeURIComponent(query);
   console.log(`[Wookafr] WP API search: "${query}"`);
 
   // Chemins relatifs — fetchText/fetchJson gèrent le fallback multi-domain
-  const apiPath = `/wp-json/v2/posts?search=${searchQuery}&per_page=10`;
+  const apiPath = `/wp-json/wp/v2/posts?search=${searchQuery}&per_page=10`;
   const posts = await fetchJson(apiPath, { timeout: TIMEOUTS.SEARCH });
   if (!posts || !Array.isArray(posts) || posts.length === 0) {
     console.log(`[Wookafr] No WP API results for "${query}"`);
@@ -286,13 +416,17 @@ async function searchViaWpApi(query, mediaType) {
     const isRelevant = title.includes(queryLower) || slug.includes(toSlug(query));
     if (!isRelevant) continue;
 
-    // Essayer film puis série
-    const probePaths = [
-      `/streaming/${slug}/`,
-      `/streaming/series/${slug}/`,
-    ];
+    // Essayer série puis film (le lien WP est toujours le bon chemin)
+    const candidates = [];
+    if (post.link) {
+      try {
+        const u = new URL(post.link)
+        candidates.push(u.pathname)
+      } catch (_) {}
+    }
+    candidates.push(`/streaming/series/${slug}/`, `/streaming/${slug}/`);
 
-    for (const p of probePaths) {
+    for (const p of candidates) {
       const html = await fetchText(p, { timeout: TIMEOUTS.SEARCH });
       if (html && html.length > 200) {
         const iframeUrl = extractIframeUrl(html);
@@ -376,6 +510,12 @@ export async function extractStreams(tmdbId, mediaType, season, episode, options
 
   const startTime = Date.now()
   const BUDGET_MS = 45000
+
+  // Fix dispatch : Nuvio passe 'series' (jamais 'tv') pour les séries —
+  // l'ancien code ne testait que 'movie' vs tout-le-reste, ce qui est OK,
+  // mais resolveTargetEpisodes exige 'tv' explicitement → lui passer 'tv'.
+  const isTv = mediaType === 'series' || mediaType === 'tv'
+
   const rawTitles = await getTmdbTitles(tmdbId, mediaType, { season })
   if (!rawTitles || rawTitles.length === 0) return []
   // Strip season suffixes (ex: "Naruto Season 1" → "Naruto") pour éviter les
@@ -389,14 +529,113 @@ export async function extractStreams(tmdbId, mediaType, season, episode, options
 
   if (isAborted(signal)) return []
 
-  if (mediaType === 'movie') {
-    return extractMovie(tmdbId, titles, subType)
+  if (!isTv) {
+    return extractMovie(tmdbId, titles, subType, startTime, BUDGET_MS, signal)
   }
 
-  return extractSeries(tmdbId, mediaType, titles, season, episode, subType)
+  return extractSeries(tmdbId, mediaType, titles, season, episode, subType, startTime, BUDGET_MS, signal)
 }
 
-async function extractMovie(tmdbId, titles, subType) {
+/**
+ * Résout une liste de candidats (interleave par langue pour garantir VF ET
+ * VOSTFR même si les premiers hosts échouent) avec budget temps.
+ * Les embeds passent par resolveStream (résolveurs uqload/vidmoly/veev/…).
+ */
+async function resolveCandidates(candidates, siteUrl, subType, startTime, budgetMs, opts = {}) {
+  const { maxResults = 4, perStreamTimeout = 9000, signal = null } = opts
+  const remaining = () => budgetMs - (Date.now() - startTime)
+
+  // Interleave par langue : [VF1, VOSTFR1, VF2, VOSTFR2, …] pour garantir
+  // les deux langues même quand le budget est serré
+  const byLang = {}
+  for (const c of candidates) {
+    const key = c.langTag || 'VF'
+    if (!byLang[key]) byLang[key] = []
+    byLang[key].push(c)
+  }
+  const langKeys = Object.keys(byLang).sort((a, b) => {
+    const order = { VF: 0, VFF: 1, VFQ: 2, VOSTFR: 3, VO: 4, MULTI: 5 }
+    return (order[a] ?? 9) - (order[b] ?? 9)
+  })
+  const ordered = []
+  const maxLen = Math.max(...langKeys.map(k => byLang[k].length), 0)
+  for (let i = 0; i < maxLen; i++) {
+    for (const k of langKeys) {
+      if (byLang[k][i]) ordered.push(byLang[k][i])
+    }
+  }
+
+  const streams = []
+  for (const cand of ordered) {
+    if (streams.length >= maxResults) break
+    if (remaining() < 5000) break
+    if (isAborted(signal)) break
+
+    const stream = toStream(cand.url, cand.langTag, 'Wookafr', siteUrl, {
+      quality: detectQuality(cand.url, cand.host),
+      subType,
+    })
+    try {
+      const resolved = await withTimeout(resolveStream(stream), perStreamTimeout)
+      if (resolved && resolved.url && resolved.isDirect !== false) {
+        streams.push({ ...resolved, provider: 'wookafr' })
+        console.log(`[Wookafr] Resolved [${cand.langTag}] ${cand.host} → ${String(resolved.url).slice(0, 70)}`)
+      } else {
+        console.log(`[Wookafr] No direct from [${cand.langTag}] ${cand.host}`)
+      }
+    } catch (e) {
+      console.log(`[Wookafr] Resolve timeout [${cand.langTag}] ${cand.host}: ${e.message}`)
+    }
+  }
+  return streams
+}
+
+/**
+ * Charge l'embed lecteurvideo depuis une page (film ou épisode) et retourne
+ * TOUS les serveurs de toutes les sections de langue.
+ */
+async function collectEmbedCandidates(pageHtml, pageUrl) {
+  const iframeUrl = extractIframeUrl(pageHtml)
+  if (!iframeUrl) {
+    console.log(`[Wookafr] No iframe on ${pageUrl}`)
+    return []
+  }
+  if (!/lecteurvideo/i.test(iframeUrl)) {
+    // Autre hôte d'embed : un seul candidat classique
+    const lang = detectLanguage(pageUrl, pageHtml)
+    return [{ url: iframeUrl, langTag: lang, host: 'embed', priority: 50 }]
+  }
+
+  // Fetch l'embed avec Referer correct (le site référant, param url=)
+  // ⚠️ Referer = TOUJOURS le domaine actuel du site (SITE.BASE_URL).
+  // Dériver le Referer du param url= de l'embed pointe vers des domaines
+  // périmés (ex: wookafr.tel) → 403 anti-hotlink vérifié en live
+  // ("Ne volez pas notre travail sur Coflix.observer").
+  // Le Referer correct (boston) donne 200 avec toutes les sections OD_*.
+  const referer = `${SITE.BASE_URL}/`
+  const res = await safeFetch(iframeUrl, {
+    headers: { Referer: referer, Origin: referer.replace(/\/$/, '') },
+    timeout: TIMEOUTS.PAGE,
+  })
+  if (!res) return []
+  const embedHtml = await res.text()
+  if (!embedHtml) return []
+
+  let servers = parseLecteurVideoServers(embedHtml)
+  if (servers.length === 0) {
+    // Ancien format : liens directs .mp4/.m3u8 dans l'embed
+    servers = extractDirectLinksFromEmbed(embedHtml).map(l => ({ ...l, priority: 45 }))
+  }
+  if (servers.length === 0) {
+    // Dernier recours : traiter l'embed lui-même comme candidat unique
+    // (resolveLecteurVideo dans resolvers.js sait extraire ses liens)
+    const lang = detectLanguage(pageUrl, pageHtml)
+    return [{ url: iframeUrl, langTag: lang, host: 'lecteurvideo', priority: 60 }]
+  }
+  return servers
+}
+
+async function extractMovie(tmdbId, titles, subType, startTime, budgetMs, signal = null) {
   const match = await trySearch(titles)
   if (!match) {
     console.warn(`[Wookafr] Movie not found for TMDB ${tmdbId}`)
@@ -406,29 +645,25 @@ async function extractMovie(tmdbId, titles, subType) {
   console.log(`[Wookafr] Movie match: ${match.title} -> ${match.url}`)
   try {
     const pageHtml = await fetchText(match.url, { timeout: TIMEOUTS.PAGE })
-    const iframeUrl = extractIframeUrl(pageHtml)
-    if (!iframeUrl) {
-      console.warn(`[Wookafr] No iframe on ${match.url}`)
+    const candidates = await collectEmbedCandidates(pageHtml, match.url)
+    if (candidates.length === 0) {
+      console.warn(`[Wookafr] No embed candidates for movie ${match.url}`)
       return []
     }
-
-      const lang = detectLanguage(match.url, pageHtml)
-      const quality = detectQuality(iframeUrl, match.title)
-
-      console.log(`[Wookafr] Iframe: ${iframeUrl} [${lang}]`)
-      const stream = toStream(iframeUrl, lang, 'Wookafr', SITE.BASE_URL, { quality, subType })
-      const resolved = await withTimeout(resolveStream(stream), 15000)
-      if (resolved && resolved.url) return [{ ...resolved, provider: 'wookafr' }]
+    console.log(`[Wookafr] Movie: ${candidates.length} serveur(s) trouvé(s)`)
+    const streams = await resolveCandidates(candidates, SITE.BASE_URL, subType, startTime, budgetMs, { signal })
+    if (streams.length > 0) return streams
   } catch (e) {
     console.warn(`[Wookafr] Movie extraction failed: ${e.message}`)
   }
   return []
 }
 
-async function extractSeries(tmdbId, mediaType, titles, season, episode, subType) {
+async function extractSeries(tmdbId, mediaType, titles, season, episode, subType, startTime, budgetMs, signal = null) {
   const effectiveSeason = titles.effectiveSeason != null ? titles.effectiveSeason : season
   const targetSeasonNum = parseInt(effectiveSeason) || 1
-  const targetEpisodeNums = await resolveTargetEpisodes(tmdbId, mediaType, season, episode, { startTime: Date.now(), budgetMs: 45000 })
+  // resolveTargetEpisodes exige mediaType === 'tv' → normaliser
+  const targetEpisodeNums = await resolveTargetEpisodes(tmdbId, 'tv', season, episode, { startTime, budgetMs: budgetMs / 2 })
 
   const match = await trySearchSeries(titles)
   if (!match) {
@@ -439,39 +674,49 @@ async function extractSeries(tmdbId, mediaType, titles, season, episode, subType
   console.log(`[Wookafr] Series match: ${match.title} -> ${match.url}`)
   try {
     const seriesHtml = await fetchText(match.url, { timeout: TIMEOUTS.PAGE })
-    const seasons = parseSeasons(seriesHtml)
+    let seasons = parseSeasons(seriesHtml)
+    let currentHtml = seriesHtml
+
     if (seasons.length === 0) {
       console.warn(`[Wookafr] No seasons on series page, trying direct iframe extraction`)
-      const iframeUrl = extractIframeUrl(seriesHtml)
-      if (iframeUrl) {
-        const lang = detectLanguage(match.url, seriesHtml)
-        const quality = detectQuality(iframeUrl, match.title)
-        const stream = toStream(iframeUrl, lang, 'Wookafr', SITE.BASE_URL, { quality, subType })
-        const resolved = await withTimeout(resolveStream(stream), 15000)
-        if (resolved && resolved.url) return [{ ...resolved, provider: 'wookafr' }]
-      }
-      return []
+      const candidates = await collectEmbedCandidates(seriesHtml, match.url)
+      if (candidates.length === 0) return []
+      return await resolveCandidates(candidates, SITE.BASE_URL, subType, startTime, budgetMs, { signal })
     }
 
     const targetSeason = seasons.find(s => {
       const sn = s.title.match(PATTERNS.SEASON_TITLE)
       return sn && parseInt(sn[1]) === targetSeasonNum
-    }) || seasons[0]
+    })
 
-    let parsedEpisodes
+    // Anti-mismatch : si la saison demandée n'existe pas sur le site, ne
+    // JAMAIS retomber sur une autre saison (l'utilisateur recevrait des
+    // épisodes qui ne correspondent pas au titre). On abandonne proprement.
+    if (!targetSeason) {
+      console.warn(`[Wookafr] Season ${targetSeasonNum} not found on site (available: ${seasons.map(s => s.title).join(', ')})`)
+      return []
+    }
+
+    let parsedEpisodes = null
 
     if (targetSeason.isActive) {
-      parsedEpisodes = parseEpisodes(seriesHtml)
-    } else {
-      const nonce = extractNonce(seriesHtml)
-      if (!nonce) {
-        console.warn(`[Wookafr] No AJAX nonce found`)
+      parsedEpisodes = parseEpisodes(currentHtml)
+    }
+
+    if (!parsedEpisodes || parsedEpisodes.length === 0) {
+      // Saison inactive → AJAX avec nonce.
+      // IMPORTANT : poster sur le domaine actuel (SITE.BASE_URL) — l'ancien
+      // code POSTait sur wookafr.center qui 301 → POST converti GET → mort.
+      const nonce = extractNonce(currentHtml)
+      const seasonId = targetSeason.id
+      if (!nonce || !seasonId) {
+        console.warn(`[Wookafr] No AJAX nonce or season id found`)
         return []
       }
 
       const ajaxData = await postForm(
         `${SITE.BASE_URL}/wp-admin/admin-ajax.php`,
-        { action: 'getepisodes', season_id: targetSeason.id, nonce },
+        { action: 'getepisodes', season_id: seasonId, nonce },
         { timeout: TIMEOUTS.AJAX }
       )
 
@@ -481,6 +726,7 @@ async function extractSeries(tmdbId, mediaType, titles, season, episode, subType
         return []
       }
       parsedEpisodes = parseEpisodes(ajaxHtml)
+      currentHtml = ajaxHtml
     }
 
     if (parsedEpisodes.length === 0) {
@@ -489,33 +735,30 @@ async function extractSeries(tmdbId, mediaType, titles, season, episode, subType
     }
 
     const seasonEpisodes = parsedEpisodes.filter(e => e.season === targetSeasonNum)
+    if (seasonEpisodes.length === 0) {
+      console.warn(`[Wookafr] No episodes tagged season ${targetSeasonNum} (AJAX returned other season?)`)
+      return []
+    }
     let ep = null
     for (const epNum of targetEpisodeNums) {
       ep = seasonEpisodes.find(e => e.episode === epNum)
       if (ep) break
     }
-    if (!ep) ep = seasonEpisodes[targetEpisodeNums[0] - 1]
-
     if (!ep) {
-      console.warn(`[Wookafr] Episode ${targetEpisodeNums[0]} not found in season ${targetSeasonNum}`)
+      console.warn(`[Wookafr] Episode ${targetEpisodeNums[0]} not found in season ${targetSeasonNum} (${seasonEpisodes.length} episodes available)`)
       return []
     }
 
     console.log(`[Wookafr] Episode: S${ep.season}E${ep.episode} -> ${ep.link}`)
     const epHtml = await fetchText(ep.link, { timeout: TIMEOUTS.PAGE })
-    const iframeUrl = extractIframeUrl(epHtml)
-    if (!iframeUrl) {
-      console.warn(`[Wookafr] No iframe on episode page`)
+    const candidates = await collectEmbedCandidates(epHtml, ep.link)
+    if (candidates.length === 0) {
+      console.warn(`[Wookafr] No embed candidates on episode page`)
       return []
     }
-
-    const lang = detectLanguage(ep.link, epHtml)
-    const quality = detectQuality(iframeUrl, ep.title)
-
-    console.log(`[Wookafr] Iframe: ${iframeUrl} [${lang}]`)
-    const stream = toStream(iframeUrl, lang, 'Wookafr', SITE.BASE_URL, { quality, subType })
-    const resolved = await withTimeout(resolveStream(stream), 20000)
-    if (resolved && resolved.url) return [{ ...resolved, provider: 'wookafr' }]
+    console.log(`[Wookafr] Episode: ${candidates.length} serveur(s) trouvé(s)`)
+    const streams = await resolveCandidates(candidates, SITE.BASE_URL, subType, startTime, budgetMs, { signal })
+    if (streams.length > 0) return streams
   } catch (e) {
     console.warn(`[Wookafr] Series extraction failed: ${e.message}`)
   }

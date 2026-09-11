@@ -1,6 +1,6 @@
 /**
  * voiranime-rip - Built from src/voiranime-rip/
- * Generated: 2026-09-10T22:03:03.45578341Z
+ * Generated: 2026-09-11T02:26:56.075616031Z
  */
 var __provider = (() => {
   var __create = Object.create;
@@ -12368,7 +12368,14 @@ var __provider = (() => {
       const start = Date.now();
       const SLOW_THRESHOLD = 15e3;
       const method = (options.method || "GET").toUpperCase();
-      const cacheKey = method + "|" + url;
+      let headerTag = "";
+      if (options.headers && typeof options.headers === "object") {
+        const keys = Object.keys(options.headers).sort();
+        if (keys.length) {
+          headerTag = "|" + keys.map((k) => `${k.toLowerCase()}=${String(options.headers[k]).slice(0, 80)}`).join("&");
+        }
+      }
+      const cacheKey = method + "|" + url + headerTag;
       if (method === "GET") {
         const cached2 = getCachedFetch(cacheKey);
         if (cached2) {
@@ -12719,6 +12726,7 @@ var __provider = (() => {
       const fallbackDomains = [originalDomain];
       if (originalDomain.endsWith(".bz")) fallbackDomains.push("uqload.co", "uqload.to");
       if (originalDomain.endsWith(".to")) fallbackDomains.push("uqload.co");
+      if (originalDomain.endsWith(".cx")) fallbackDomains.push("uqload.co", "uqload.vc");
       const uniqueDomains = [...new Set(fallbackDomains)];
       const EXPIRED_MARKERS = [
         "file is no longer available",
@@ -12729,40 +12737,41 @@ var __provider = (() => {
         const low = html.toLowerCase();
         return EXPIRED_MARKERS.some((m) => low.includes(m));
       };
-      return new Promise((resolve) => {
-        let failures = 0;
-        let resolved = false;
-        const checkDomain = (domain) => __async(null, null, function* () {
+      const isRestrictedStub = (html) => html.length < 200 && /restricted for this domain/i.test(html);
+      const refererChain = [
+        `https://${uniqueDomains[0]}/`,
+        // self (comportement historique, autres providers)
+        "https://lecteurvideo.com/",
+        // parent lecteurvideo (chaîne wookafr)
+        ""
+        // sans Referer
+      ];
+      const extractFile = (content) => content.match(/file\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/i) || content.match(/sources\s*:\s*\[[^\]]*?\{[^}]*?file\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/i) || content.match(/sources\s*:\s*\[["']([^"']+\.(?:mp4|m3u8)[^"']*)["']\]/i) || content.match(/["'](https?:\/\/[^"']*\/hls\d?\/[^"']*\.m3u8[^"']*)["']/i) || content.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)["']/i);
+      for (const domain of uniqueDomains) {
+        const tryUrl = `https://${domain}${normalizedPath}`;
+        for (const referer of refererChain) {
           try {
-            const tryUrl = `https://${domain}${normalizedPath}`;
-            const ref = `https://${domain}/`;
-            const res = yield safeFetch(tryUrl, { headers: __spreadProps(__spreadValues({}, HEADERS), { "Referer": ref }) });
-            if (res) {
-              const html = yield res.text();
-              if (isExpiredPage(html) && !resolved) {
-                resolved = true;
-                console.warn(`[Resolver] uqload embed dead (expired/deleted): ${url.slice(0, 80)}`);
-                resolve({ url, isDead: true });
-                return;
-              }
-              let content = html;
-              if (content.includes("p,a,c,k,e,d") || content.includes("eval(function")) content = unpack(content);
-              const match = content.match(/sources\s*:\s*\[[^\]]*?\{[^}]*?file\s*:\s*["']([^"']+\.(?:mp4|m3u8))["']/i) || content.match(/sources\s*:\s*\[["']([^"']+\.(?:mp4|m3u8))["']\]/i) || content.match(/file\s*:\s*["']([^"']+\.(?:mp4|m3u8))["']/i);
-              if (match && !resolved) {
-                resolved = true;
-                resolve({ url: match[1], headers: { "Referer": ref } });
-                return;
-              }
+            const headers = __spreadValues({}, HEADERS);
+            if (referer) headers["Referer"] = referer;
+            const res = yield safeFetch(tryUrl, { headers });
+            if (!res) continue;
+            let html = yield res.text();
+            if (isExpiredPage(html)) {
+              console.warn(`[Resolver] uqload embed dead (expired/deleted): ${url.slice(0, 80)}`);
+              return { url, isDead: true };
+            }
+            if (isRestrictedStub(html) || !html.includes("p,a,c,k,e,d") && !html.includes("eval(function") && !extractFile(html)) continue;
+            if (html.includes("p,a,c,k,e,d") || html.includes("eval(function")) html = unpack(html);
+            const match = extractFile(html);
+            if (match) {
+              const playHeaders = { "Referer": `https://${domain}/` };
+              return { url: match[1], headers: playHeaders };
             }
           } catch (e) {
           }
-          failures++;
-          if (failures === uniqueDomains.length && !resolved) {
-            resolve({ url });
-          }
-        });
-        uniqueDomains.forEach(checkDomain);
-      });
+        }
+      }
+      return { url };
     });
   }
   function resolveVoe(url) {
@@ -13301,7 +13310,7 @@ var __provider = (() => {
           if (knownSlowHost || deadEmbed) {
             return __spreadProps(__spreadValues({}, stream), { isDirect: false });
           }
-          const skipDirectScan = result && result.url === originalUrl && depth === 0;
+          let skipDirectScan = result && result.url === originalUrl && depth === 0;
           const res = yield safeFetch(originalUrl, { headers: stream.headers });
           if (res) {
             let html = yield res.text();
@@ -13322,7 +13331,9 @@ var __provider = (() => {
               console.log(`[Resolver] Peeling: Found nested iframe -> ${iframeUrl}`);
               const peeledResult = yield resolveStream(__spreadProps(__spreadValues({}, stream), { url: iframeUrl }), depth + 1);
               if (peeledResult && peeledResult.isDirect) return peeledResult;
-              if (depth > 0) return peeledResult;
+              if (depth > 0) {
+                skipDirectScan = false;
+              }
             }
             if (!skipDirectScan) {
               const strictUrl = html.match(/file\s*:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/i) || html.match(/sources\s*:\s*\[["']([^"']+\.(?:m3u8|mp4)[^"']*)["']\]/i) || html.match(/'hls'\s*:\s*'([^']+)'/) || html.match(/"hls"\s*:\s*"([^"]+)"/);
@@ -13373,7 +13384,7 @@ var __provider = (() => {
       PROVIDER_BUDGET_MS = 45e3;
       MAX_STREAMS_PER_PROVIDER = 80;
       MAX_SAFE_FETCH_BODY_BYTES = 1024 * 1024;
-      BUILD_HASH = true ? "41210d4f" : "dev";
+      BUILD_HASH = true ? "3344d314" : "dev";
       HAS_NATIVE_CRYPTO = typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
       _nodeCrypto = null;
       try {

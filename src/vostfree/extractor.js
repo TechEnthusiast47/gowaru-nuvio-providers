@@ -12,11 +12,23 @@ const BASE_URL = "https://ipv4.vostfree.ws";
 const MAX_SEARCH_TITLES = 9;
 const MIN_QUERY_LENGTH = 5;
 
-const KNOWN_HOSTS = ['sibnet', 'uqload', 'oneupload', 'sendvid', 'voe', 'dood', 'stape', 'streamtape', 'myvi', 'mytv', 'vidmoly', 'fsvid', 'vidzy'];
+// ⚠️ Plus de filtre dur : les hosts du site ROTENT (vérifié en live — upvid/
+// ninjastream/vudeo ont remplacé sibnet sur certaines fiches en 2026, et le
+// filtre d'origine a rendu le provider muet pendant des semaines). On
+// ORGANISE les players par priorité de résolution et on tente tout via
+// resolveStream, qui sait lui-même rejeter les hosts morts.
+const HOST_PRIORITY = [
+    'sibnet',      // ✅ résout en direct (API metadata), dominant sur les fiches récentes
+    'uqload',      // ✅ résolveur natif (Referer whitelist + regex query-string)
+    'vidmoly',
+    'myvi',
+    'sendvid',
+];
 
-// Hosts whose embed pages use React SPA / AES-GCM fingerprinting
-// and cannot be resolved to direct URLs without a browser.
-const UNRESOLVABLE_HOSTS = ['voe', 'streamtape', 'stape', 'dood', 'ds2play', 'bigwar5'];
+// Hosts dont l'embed est un mur JS/fingerprint ou un DNS mort — vérifiés en
+// live 2026-09 : inutile de dépenser du budget resolveStream dessus.
+const UNRESOLVABLE_HOSTS = ['voe', 'streamtape', 'stape', 'dood', 'ds2play', 'bigwar5',
+    'ninjastream', 'upvid', 'opvid', 'jetload', 'getvid', 'lvturbo', 'streamlare'];
 const PLAYER_TIMEOUT_MS = 8000;
 const BUDGET_MS = 45000;
 
@@ -308,12 +320,18 @@ export async function extractStreams(tmdbId, mediaType, season, episode, options
             console.log(`[Vostfree] Using buttons ID: ${buttonsId} for ${lang}`);
             const playerElements = $(`#${buttonsId} div[id^="player_"]`).toArray();
 
-            const filteredPlayers = playerElements.filter(el => {
+            // Priorité sibnet → uqload → reste ; pas de rejet de host inconnu
+            // (les rotations du site ne doivent plus rendre le provider muet)
+            const priorityOf = (el) => {
                 const elClass = ($(el).attr('class') || '').toLowerCase();
                 const pName = $(el).text().trim().toLowerCase();
                 const combined = elClass + ' ' + pName;
-                return KNOWN_HOSTS.some(h => combined.includes(h.toLowerCase()));
-            });
+                for (let i = 0; i < HOST_PRIORITY.length; i++) {
+                    if (combined.includes(HOST_PRIORITY[i])) return i;
+                }
+                return HOST_PRIORITY.length; // inconnus après les connus
+            };
+            const filteredPlayers = [...playerElements].sort((a, b) => priorityOf(a) - priorityOf(b));
 
             // OPTIMISATION: Résolution séquentielle avec early-exit
             // (fetch synchrone en QuickJS = Promise.allSettled ne parallélise pas)
@@ -362,14 +380,8 @@ export async function extractStreams(tmdbId, mediaType, season, episode, options
                 const urlLower = url.toLowerCase();
                 const isUnresolvable = UNRESOLVABLE_HOSTS.some(h => urlLower.includes(h));
                 if (isUnresolvable) {
-                    streams.push({
-                        name: `Vostfree (${lang})`,
-                        title: `${playerName} - ${lang}`,
-                        url: url,
-                        quality: "HD",
-                        headers: { "Referer": BASE_URL },
-                        isDirect: false,
-                    });
+                    // Convention repo : ne JAMAIS retourner d'embed irrésolu
+                    // (non jouable par ExoPlayer) — on ignore ce player.
                     continue;
                 }
                 try {
@@ -379,6 +391,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode, options
                             title: `${playerName} - ${lang}`,
                             url: url,
                             quality: "HD",
+                            language: 'fr',
                             headers: { "Referer": BASE_URL }
                         }),
                         PLAYER_TIMEOUT_MS,
@@ -418,7 +431,7 @@ export async function extractStreams(tmdbId, mediaType, season, episode, options
         title: s.title || 'Stream',
         url: s.url || '',
         quality: s.quality || 'HD',
-        language: s.language || null,
+        language: s.language || 'fr',
         isDirect: !!s.isDirect,
         headers: s.headers || {}
     }));

@@ -1,6 +1,6 @@
 /**
  * waveanime - Built from src/waveanime/
- * Generated: 2026-09-10T22:03:03.566783519Z
+ * Generated: 2026-09-11T02:26:56.165616125Z
  */
 var __provider = (() => {
   var __create = Object.create;
@@ -556,7 +556,14 @@ var __provider = (() => {
       const start = Date.now();
       const SLOW_THRESHOLD = 15e3;
       const method = (options.method || "GET").toUpperCase();
-      const cacheKey = method + "|" + url;
+      let headerTag = "";
+      if (options.headers && typeof options.headers === "object") {
+        const keys = Object.keys(options.headers).sort();
+        if (keys.length) {
+          headerTag = "|" + keys.map((k) => `${k.toLowerCase()}=${String(options.headers[k]).slice(0, 80)}`).join("&");
+        }
+      }
+      const cacheKey = method + "|" + url + headerTag;
       if (method === "GET") {
         const cached = getCachedFetch(cacheKey);
         if (cached) {
@@ -668,7 +675,7 @@ var __provider = (() => {
       PROVIDER_BUDGET_MS = 45e3;
       MAX_STREAMS_PER_PROVIDER = 80;
       MAX_SAFE_FETCH_BODY_BYTES = 1024 * 1024;
-      BUILD_HASH = true ? "41210d4f" : "dev";
+      BUILD_HASH = true ? "3344d314" : "dev";
       HAS_NATIVE_CRYPTO = typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
       _nodeCrypto = null;
       try {

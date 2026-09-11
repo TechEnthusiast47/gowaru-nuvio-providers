@@ -1,6 +1,6 @@
 /**
  * wookafr - Built from src/wookafr/
- * Generated: 2026-09-10T22:03:03.619783566Z
+ * Generated: 2026-09-11T02:26:56.215616165Z
  */
 var __provider = (() => {
   var __create = Object.create;
@@ -562,7 +562,14 @@ var __provider = (() => {
       const start = Date.now();
       const SLOW_THRESHOLD = 15e3;
       const method = (options.method || "GET").toUpperCase();
-      const cacheKey = method + "|" + url;
+      let headerTag = "";
+      if (options.headers && typeof options.headers === "object") {
+        const keys = Object.keys(options.headers).sort();
+        if (keys.length) {
+          headerTag = "|" + keys.map((k) => `${k.toLowerCase()}=${String(options.headers[k]).slice(0, 80)}`).join("&");
+        }
+      }
+      const cacheKey = method + "|" + url + headerTag;
       if (method === "GET") {
         const cached = getCachedFetch(cacheKey);
         if (cached) {
@@ -913,6 +920,7 @@ var __provider = (() => {
       const fallbackDomains = [originalDomain];
       if (originalDomain.endsWith(".bz")) fallbackDomains.push("uqload.co", "uqload.to");
       if (originalDomain.endsWith(".to")) fallbackDomains.push("uqload.co");
+      if (originalDomain.endsWith(".cx")) fallbackDomains.push("uqload.co", "uqload.vc");
       const uniqueDomains = [...new Set(fallbackDomains)];
       const EXPIRED_MARKERS = [
         "file is no longer available",
@@ -923,40 +931,41 @@ var __provider = (() => {
         const low = html.toLowerCase();
         return EXPIRED_MARKERS.some((m) => low.includes(m));
       };
-      return new Promise((resolve) => {
-        let failures = 0;
-        let resolved = false;
-        const checkDomain = (domain) => __async(null, null, function* () {
+      const isRestrictedStub = (html) => html.length < 200 && /restricted for this domain/i.test(html);
+      const refererChain = [
+        `https://${uniqueDomains[0]}/`,
+        // self (comportement historique, autres providers)
+        "https://lecteurvideo.com/",
+        // parent lecteurvideo (chaîne wookafr)
+        ""
+        // sans Referer
+      ];
+      const extractFile = (content) => content.match(/file\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/i) || content.match(/sources\s*:\s*\[[^\]]*?\{[^}]*?file\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/i) || content.match(/sources\s*:\s*\[["']([^"']+\.(?:mp4|m3u8)[^"']*)["']\]/i) || content.match(/["'](https?:\/\/[^"']*\/hls\d?\/[^"']*\.m3u8[^"']*)["']/i) || content.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)["']/i);
+      for (const domain of uniqueDomains) {
+        const tryUrl = `https://${domain}${normalizedPath}`;
+        for (const referer of refererChain) {
           try {
-            const tryUrl = `https://${domain}${normalizedPath}`;
-            const ref = `https://${domain}/`;
-            const res = yield safeFetch(tryUrl, { headers: __spreadProps(__spreadValues({}, HEADERS), { "Referer": ref }) });
-            if (res) {
-              const html = yield res.text();
-              if (isExpiredPage(html) && !resolved) {
-                resolved = true;
-                console.warn(`[Resolver] uqload embed dead (expired/deleted): ${url.slice(0, 80)}`);
-                resolve({ url, isDead: true });
-                return;
-              }
-              let content = html;
-              if (content.includes("p,a,c,k,e,d") || content.includes("eval(function")) content = unpack(content);
-              const match = content.match(/sources\s*:\s*\[[^\]]*?\{[^}]*?file\s*:\s*["']([^"']+\.(?:mp4|m3u8))["']/i) || content.match(/sources\s*:\s*\[["']([^"']+\.(?:mp4|m3u8))["']\]/i) || content.match(/file\s*:\s*["']([^"']+\.(?:mp4|m3u8))["']/i);
-              if (match && !resolved) {
-                resolved = true;
-                resolve({ url: match[1], headers: { "Referer": ref } });
-                return;
-              }
+            const headers = __spreadValues({}, HEADERS);
+            if (referer) headers["Referer"] = referer;
+            const res = yield safeFetch(tryUrl, { headers });
+            if (!res) continue;
+            let html = yield res.text();
+            if (isExpiredPage(html)) {
+              console.warn(`[Resolver] uqload embed dead (expired/deleted): ${url.slice(0, 80)}`);
+              return { url, isDead: true };
+            }
+            if (isRestrictedStub(html) || !html.includes("p,a,c,k,e,d") && !html.includes("eval(function") && !extractFile(html)) continue;
+            if (html.includes("p,a,c,k,e,d") || html.includes("eval(function")) html = unpack(html);
+            const match = extractFile(html);
+            if (match) {
+              const playHeaders = { "Referer": `https://${domain}/` };
+              return { url: match[1], headers: playHeaders };
             }
           } catch (e) {
           }
-          failures++;
-          if (failures === uniqueDomains.length && !resolved) {
-            resolve({ url });
-          }
-        });
-        uniqueDomains.forEach(checkDomain);
-      });
+        }
+      }
+      return { url };
     });
   }
   function resolveVoe(url) {
@@ -1495,7 +1504,7 @@ var __provider = (() => {
           if (knownSlowHost || deadEmbed) {
             return __spreadProps(__spreadValues({}, stream), { isDirect: false });
           }
-          const skipDirectScan = result && result.url === originalUrl && depth === 0;
+          let skipDirectScan = result && result.url === originalUrl && depth === 0;
           const res = yield safeFetch(originalUrl, { headers: stream.headers });
           if (res) {
             let html = yield res.text();
@@ -1516,7 +1525,9 @@ var __provider = (() => {
               console.log(`[Resolver] Peeling: Found nested iframe -> ${iframeUrl}`);
               const peeledResult = yield resolveStream(__spreadProps(__spreadValues({}, stream), { url: iframeUrl }), depth + 1);
               if (peeledResult && peeledResult.isDirect) return peeledResult;
-              if (depth > 0) return peeledResult;
+              if (depth > 0) {
+                skipDirectScan = false;
+              }
             }
             if (!skipDirectScan) {
               const strictUrl = html.match(/file\s*:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/i) || html.match(/sources\s*:\s*\[["']([^"']+\.(?:m3u8|mp4)[^"']*)["']\]/i) || html.match(/'hls'\s*:\s*'([^']+)'/) || html.match(/"hls"\s*:\s*"([^"]+)"/);
@@ -1567,7 +1578,7 @@ var __provider = (() => {
       PROVIDER_BUDGET_MS = 45e3;
       MAX_STREAMS_PER_PROVIDER = 80;
       MAX_SAFE_FETCH_BODY_BYTES = 1024 * 1024;
-      BUILD_HASH = true ? "41210d4f" : "dev";
+      BUILD_HASH = true ? "3344d314" : "dev";
       HAS_NATIVE_CRYPTO = typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
       _nodeCrypto = null;
       try {
@@ -1717,18 +1728,20 @@ var __provider = (() => {
   });
 
   // src/wookafr/config.js
-  var SITE, ENDPOINTS, SELECTORS, PATTERNS, TIMEOUTS, SCORES, ANIME_GENRE_ID, ANIME_KEYWORDS, CACHE_TTL, MAX_SEARCH_TITLES, CACHE_NAMESPACE, CACHE_TAG;
+  var SITE, ENDPOINTS, SELECTORS, PATTERNS, TIMEOUTS, SCORES, LECTEURVIDEO_LANG_SECTIONS, LECTEURVIDEO_KNOWN_HOSTS, ANIME_GENRE_ID, ANIME_KEYWORDS, CACHE_TTL, MAX_SEARCH_TITLES, CACHE_NAMESPACE, CACHE_TAG;
   var init_config = __esm({
     "src/wookafr/config.js"() {
       SITE = {
-        BASE_URL: "https://wookafr.center",
-        DOMAINS: ["https://wookafr.center", "https://wookafr.cymru", "https://wookafr.fyi", "https://wookafr.bond", "https://wookafr.blue"],
-        DOMAIN: "wookafr.center"
+        // Domaine actuel vérifié en live (2026-09) : les anciens domaines
+        // redirigent tous en 301 vers boston (et certains en boucle circulaire).
+        BASE_URL: "https://wookafr.boston",
+        DOMAINS: ["https://wookafr.boston", "https://wookafr.center"],
+        DOMAIN: "wookafr.boston"
       };
       ENDPOINTS = {
         SEARCH: `${SITE.BASE_URL}/?s=`,
         AJAX: `${SITE.BASE_URL}/wp-admin/admin-ajax.php`,
-        WP_API: `/wp-json/v2/posts`
+        WP_API: "/wp-json/wp/v2/posts"
       };
       SELECTORS = {
         SEARCH_CARD: "article.moviecard",
@@ -1764,6 +1777,34 @@ var __provider = (() => {
         EXACT_MATCH: 150,
         STRONG_MATCH: 100
       };
+      LECTEURVIDEO_LANG_SECTIONS = {
+        FR: "VF",
+        VFF: "VFF",
+        VFQ: "VFQ",
+        VFI: "VF",
+        VOSTFR: "VOSTFR",
+        VOST: "VOSTFR",
+        EN: "VO",
+        VO: "VO"
+      };
+      LECTEURVIDEO_KNOWN_HOSTS = [
+        "uqload.",
+        "vidmoly.",
+        "veev.",
+        "waaw.to",
+        "voe.",
+        "filemoon",
+        "emmmmbed.com",
+        "wishonly.site",
+        "coflix.",
+        "oneupload.",
+        "vidoza.",
+        "sendvid.",
+        "sibnet.ru",
+        "myvi.",
+        "luluvid.",
+        "upn.one"
+      ];
       ANIME_GENRE_ID = 16;
       ANIME_KEYWORDS = /\b(?:anime|japonais|japon|shonen|shoujo|seinen|manga)\b/i;
       CACHE_TTL = 5 * 60 * 1e3;
@@ -14347,13 +14388,25 @@ var __provider = (() => {
     const m = html.match(PATTERNS.SM_PUBLIC);
     return m ? m[2] : null;
   }
+  function safeHasClass($el, cls) {
+    try {
+      if (typeof $el.hasClass === "function") return $el.hasClass(cls);
+    } catch (_) {
+    }
+    try {
+      const raw = $el && $el.length ? $el[0] && $el[0].attribs && $el[0].attribs.class || "" : "";
+      return raw.split(/\s+/).includes(cls);
+    } catch (_) {
+    }
+    return false;
+  }
   function parseSeasons(html) {
     const $ = import_cheerio_without_node_native2.default.load(html);
     const seasons = [];
     $(SELECTORS.SEASON_BUTTON).each((_, el) => {
       const id = $(el).attr("data-season");
       const title = $(el).text().trim();
-      const isActive = $(el).hasClass("active");
+      const isActive = safeHasClass($(el), "active");
       if (id) seasons.push({ id, title, isActive });
     });
     return seasons;
@@ -14393,10 +14446,92 @@ var __provider = (() => {
     if (src && src.startsWith("//")) src = "https:" + src;
     return src || null;
   }
+  function decodeB64Url(token) {
+    if (!token) return null;
+    try {
+      let s = String(token).trim().replace(/-/g, "+").replace(/_/g, "/");
+      while (s.length % 4) s += "=";
+      let decoded = "";
+      if (typeof atob === "function") {
+        decoded = atob(s);
+      } else {
+        return null;
+      }
+      if (!/^https?:\/\//i.test(decoded)) return null;
+      return decoded;
+    } catch (_) {
+      return null;
+    }
+  }
+  function parseLecteurVideoServers(embedHtml) {
+    const html = String(embedHtml || "");
+    if (!html) return [];
+    const candidates = [];
+    const sectionRe = /class="OD\s+OD_([A-Za-z]+)[^"]*"/g;
+    const sections = [];
+    let m;
+    while ((m = sectionRe.exec(html)) !== null) {
+      sections.push({ lang: m[1].toUpperCase(), start: m.index });
+    }
+    for (let i = 0; i < sections.length; i++) {
+      sections[i].end = i + 1 < sections.length ? sections[i + 1].start : html.length;
+    }
+    const LANG_ORDER = { VF: 0, VFF: 1, VFQ: 2, VOSTFR: 3, VO: 4, EN: 4 };
+    const KNOWN = LECTEURVIDEO_KNOWN_HOSTS;
+    for (const sec of sections) {
+      const langTag = LECTEURVIDEO_LANG_SECTIONS[sec.lang];
+      if (!langTag) continue;
+      const chunk = html.slice(sec.start, sec.end);
+      let sm;
+      const svRe = /showVideo\(\s*['"]([A-Za-z0-9+/=_-]+)['"]\s*(?:,\s*['"]?(\d+)['"]?)?\s*\)/g;
+      while ((sm = svRe.exec(chunk)) !== null) {
+        const url = decodeB64Url(sm[1]);
+        if (!url) continue;
+        const lower = url.toLowerCase();
+        if (!KNOWN.some((k) => lower.includes(k))) continue;
+        if (/\.(png|jpe?g|gif|webp|css|js)(\?|$)/i.test(lower)) continue;
+        let priority = 50;
+        if (lower.includes("uqload")) priority = 10;
+        else if (lower.includes("vidmoly")) priority = 12;
+        else if (lower.includes("veev.")) priority = 15;
+        else if (lower.includes("waaw.")) priority = 16;
+        else if (lower.includes("filemoon")) priority = 20;
+        else if (lower.includes("voe.")) priority = 22;
+        else if (lower.includes("emmmmbed")) priority = 25;
+        else if (lower.includes("coflix") || lower.includes("upn.one")) priority = 30;
+        else if (lower.includes("wishonly")) priority = 40;
+        candidates.push({
+          url,
+          langTag,
+          host: (url.match(/^https?:\/\/([^/]+)/) || [])[1] || "lecteurvideo",
+          priority,
+          secLang: sec.lang
+        });
+      }
+    }
+    const seen = /* @__PURE__ */ new Set();
+    const deduped = [];
+    for (const c of candidates.sort((a, b) => a.priority - b.priority)) {
+      if (seen.has(c.url)) continue;
+      seen.add(c.url);
+      deduped.push(c);
+    }
+    return deduped;
+  }
+  function extractDirectLinksFromEmbed(embedHtml) {
+    const links = [];
+    const html = String(embedHtml || "");
+    const directRe = /["'](https?:\/\/[^"']+?\.(?:m3u8|mp4)[^"']*)["']/gi;
+    let m;
+    while ((m = directRe.exec(html)) !== null) {
+      links.push({ url: m[1], langTag: "VF", host: "direct" });
+    }
+    return links;
+  }
   function detectLanguage(url, html) {
     const u = url.toLowerCase();
     if (u.includes("vostfr") || u.includes("vost")) return "VOSTFR";
-    if (u.includes("vf") || u.includes("french")) return "VF";
+    if (u.includes("french") || /\/vf[-/.]/.test(u)) return "VF";
     if (u.includes("vo") || u.includes("english")) return "VO";
     const $ = html ? import_cheerio_without_node_native2.default.load(html) : null;
     if ($) {
@@ -14530,7 +14665,7 @@ var __provider = (() => {
       var _a, _b;
       const searchQuery = encodeURIComponent(query);
       console.log(`[Wookafr] WP API search: "${query}"`);
-      const apiPath = `/wp-json/v2/posts?search=${searchQuery}&per_page=10`;
+      const apiPath = `/wp-json/wp/v2/posts?search=${searchQuery}&per_page=10`;
       const posts = yield fetchJson(apiPath, { timeout: TIMEOUTS.SEARCH });
       if (!posts || !Array.isArray(posts) || posts.length === 0) {
         console.log(`[Wookafr] No WP API results for "${query}"`);
@@ -14543,11 +14678,16 @@ var __provider = (() => {
         const queryLower = query.toLowerCase();
         const isRelevant = title.includes(queryLower) || slug.includes(toSlug(query));
         if (!isRelevant) continue;
-        const probePaths = [
-          `/streaming/${slug}/`,
-          `/streaming/series/${slug}/`
-        ];
-        for (const p of probePaths) {
+        const candidates = [];
+        if (post.link) {
+          try {
+            const u = new URL(post.link);
+            candidates.push(u.pathname);
+          } catch (_) {
+          }
+        }
+        candidates.push(`/streaming/series/${slug}/`, `/streaming/${slug}/`);
+        for (const p of candidates) {
           const html = yield fetchText(p, { timeout: TIMEOUTS.SEARCH });
           if (html && html.length > 200) {
             const iframeUrl = extractIframeUrl(html);
@@ -14613,6 +14753,7 @@ var __provider = (() => {
       setCurrentSignal(signal);
       const startTime = Date.now();
       const BUDGET_MS = 45e3;
+      const isTv = mediaType === "series" || mediaType === "tv";
       const rawTitles = yield getTmdbTitles(tmdbId, mediaType, { season });
       if (!rawTitles || rawTitles.length === 0) return [];
       const titles = rawTitles.map((t) => stripSeasonSuffix(t));
@@ -14621,13 +14762,89 @@ var __provider = (() => {
       const subType = yield detectSubType(tmdbId, mediaType, titles);
       if (subType) console.log(`[Wookafr] Detected subtype: ${subType}`);
       if (isAborted(signal)) return [];
-      if (mediaType === "movie") {
-        return extractMovie(tmdbId, titles, subType);
+      if (!isTv) {
+        return extractMovie(tmdbId, titles, subType, startTime, BUDGET_MS, signal);
       }
-      return extractSeries(tmdbId, mediaType, titles, season, episode, subType);
+      return extractSeries(tmdbId, mediaType, titles, season, episode, subType, startTime, BUDGET_MS, signal);
     });
   }
-  function extractMovie(tmdbId, titles, subType) {
+  function resolveCandidates(_0, _1, _2, _3, _4) {
+    return __async(this, arguments, function* (candidates, siteUrl, subType, startTime, budgetMs, opts = {}) {
+      const { maxResults = 4, perStreamTimeout = 9e3, signal = null } = opts;
+      const remaining = () => budgetMs - (Date.now() - startTime);
+      const byLang = {};
+      for (const c of candidates) {
+        const key = c.langTag || "VF";
+        if (!byLang[key]) byLang[key] = [];
+        byLang[key].push(c);
+      }
+      const langKeys = Object.keys(byLang).sort((a, b) => {
+        var _a, _b;
+        const order = { VF: 0, VFF: 1, VFQ: 2, VOSTFR: 3, VO: 4, MULTI: 5 };
+        return ((_a = order[a]) != null ? _a : 9) - ((_b = order[b]) != null ? _b : 9);
+      });
+      const ordered = [];
+      const maxLen = Math.max(...langKeys.map((k) => byLang[k].length), 0);
+      for (let i = 0; i < maxLen; i++) {
+        for (const k of langKeys) {
+          if (byLang[k][i]) ordered.push(byLang[k][i]);
+        }
+      }
+      const streams = [];
+      for (const cand of ordered) {
+        if (streams.length >= maxResults) break;
+        if (remaining() < 5e3) break;
+        if (isAborted(signal)) break;
+        const stream = toStream(cand.url, cand.langTag, "Wookafr", siteUrl, {
+          quality: detectQuality(cand.url, cand.host),
+          subType
+        });
+        try {
+          const resolved = yield withTimeout(resolveStream(stream), perStreamTimeout);
+          if (resolved && resolved.url && resolved.isDirect !== false) {
+            streams.push(__spreadProps(__spreadValues({}, resolved), { provider: "wookafr" }));
+            console.log(`[Wookafr] Resolved [${cand.langTag}] ${cand.host} \u2192 ${String(resolved.url).slice(0, 70)}`);
+          } else {
+            console.log(`[Wookafr] No direct from [${cand.langTag}] ${cand.host}`);
+          }
+        } catch (e) {
+          console.log(`[Wookafr] Resolve timeout [${cand.langTag}] ${cand.host}: ${e.message}`);
+        }
+      }
+      return streams;
+    });
+  }
+  function collectEmbedCandidates(pageHtml, pageUrl) {
+    return __async(this, null, function* () {
+      const iframeUrl = extractIframeUrl(pageHtml);
+      if (!iframeUrl) {
+        console.log(`[Wookafr] No iframe on ${pageUrl}`);
+        return [];
+      }
+      if (!/lecteurvideo/i.test(iframeUrl)) {
+        const lang = detectLanguage(pageUrl, pageHtml);
+        return [{ url: iframeUrl, langTag: lang, host: "embed", priority: 50 }];
+      }
+      const referer = `${SITE.BASE_URL}/`;
+      const res = yield safeFetch(iframeUrl, {
+        headers: { Referer: referer, Origin: referer.replace(/\/$/, "") },
+        timeout: TIMEOUTS.PAGE
+      });
+      if (!res) return [];
+      const embedHtml = yield res.text();
+      if (!embedHtml) return [];
+      let servers = parseLecteurVideoServers(embedHtml);
+      if (servers.length === 0) {
+        servers = extractDirectLinksFromEmbed(embedHtml).map((l) => __spreadProps(__spreadValues({}, l), { priority: 45 }));
+      }
+      if (servers.length === 0) {
+        const lang = detectLanguage(pageUrl, pageHtml);
+        return [{ url: iframeUrl, langTag: lang, host: "lecteurvideo", priority: 60 }];
+      }
+      return servers;
+    });
+  }
+  function extractMovie(tmdbId, titles, subType, startTime, budgetMs, signal = null) {
     return __async(this, null, function* () {
       const match = yield trySearch(titles);
       if (!match) {
@@ -14637,29 +14854,26 @@ var __provider = (() => {
       console.log(`[Wookafr] Movie match: ${match.title} -> ${match.url}`);
       try {
         const pageHtml = yield fetchText(match.url, { timeout: TIMEOUTS.PAGE });
-        const iframeUrl = extractIframeUrl(pageHtml);
-        if (!iframeUrl) {
-          console.warn(`[Wookafr] No iframe on ${match.url}`);
+        const candidates = yield collectEmbedCandidates(pageHtml, match.url);
+        if (candidates.length === 0) {
+          console.warn(`[Wookafr] No embed candidates for movie ${match.url}`);
           return [];
         }
-        const lang = detectLanguage(match.url, pageHtml);
-        const quality = detectQuality(iframeUrl, match.title);
-        console.log(`[Wookafr] Iframe: ${iframeUrl} [${lang}]`);
-        const stream = toStream(iframeUrl, lang, "Wookafr", SITE.BASE_URL, { quality, subType });
-        const resolved = yield withTimeout(resolveStream(stream), 15e3);
-        if (resolved && resolved.url) return [__spreadProps(__spreadValues({}, resolved), { provider: "wookafr" })];
+        console.log(`[Wookafr] Movie: ${candidates.length} serveur(s) trouv\xE9(s)`);
+        const streams = yield resolveCandidates(candidates, SITE.BASE_URL, subType, startTime, budgetMs, { signal });
+        if (streams.length > 0) return streams;
       } catch (e) {
         console.warn(`[Wookafr] Movie extraction failed: ${e.message}`);
       }
       return [];
     });
   }
-  function extractSeries(tmdbId, mediaType, titles, season, episode, subType) {
+  function extractSeries(tmdbId, mediaType, titles, season, episode, subType, startTime, budgetMs, signal = null) {
     return __async(this, null, function* () {
       var _a;
       const effectiveSeason = titles.effectiveSeason != null ? titles.effectiveSeason : season;
       const targetSeasonNum = parseInt(effectiveSeason) || 1;
-      const targetEpisodeNums = yield resolveTargetEpisodes(tmdbId, mediaType, season, episode, { startTime: Date.now(), budgetMs: 45e3 });
+      const targetEpisodeNums = yield resolveTargetEpisodes(tmdbId, "tv", season, episode, { startTime, budgetMs: budgetMs / 2 });
       const match = yield trySearchSeries(titles);
       if (!match) {
         console.warn(`[Wookafr] Series not found for TMDB ${tmdbId}`);
@@ -14668,35 +14882,36 @@ var __provider = (() => {
       console.log(`[Wookafr] Series match: ${match.title} -> ${match.url}`);
       try {
         const seriesHtml = yield fetchText(match.url, { timeout: TIMEOUTS.PAGE });
-        const seasons = parseSeasons(seriesHtml);
+        let seasons = parseSeasons(seriesHtml);
+        let currentHtml = seriesHtml;
         if (seasons.length === 0) {
           console.warn(`[Wookafr] No seasons on series page, trying direct iframe extraction`);
-          const iframeUrl2 = extractIframeUrl(seriesHtml);
-          if (iframeUrl2) {
-            const lang2 = detectLanguage(match.url, seriesHtml);
-            const quality2 = detectQuality(iframeUrl2, match.title);
-            const stream2 = toStream(iframeUrl2, lang2, "Wookafr", SITE.BASE_URL, { quality: quality2, subType });
-            const resolved2 = yield withTimeout(resolveStream(stream2), 15e3);
-            if (resolved2 && resolved2.url) return [__spreadProps(__spreadValues({}, resolved2), { provider: "wookafr" })];
-          }
-          return [];
+          const candidates2 = yield collectEmbedCandidates(seriesHtml, match.url);
+          if (candidates2.length === 0) return [];
+          return yield resolveCandidates(candidates2, SITE.BASE_URL, subType, startTime, budgetMs, { signal });
         }
         const targetSeason = seasons.find((s) => {
           const sn = s.title.match(PATTERNS.SEASON_TITLE);
           return sn && parseInt(sn[1]) === targetSeasonNum;
-        }) || seasons[0];
-        let parsedEpisodes;
+        });
+        if (!targetSeason) {
+          console.warn(`[Wookafr] Season ${targetSeasonNum} not found on site (available: ${seasons.map((s) => s.title).join(", ")})`);
+          return [];
+        }
+        let parsedEpisodes = null;
         if (targetSeason.isActive) {
-          parsedEpisodes = parseEpisodes(seriesHtml);
-        } else {
-          const nonce = extractNonce(seriesHtml);
-          if (!nonce) {
-            console.warn(`[Wookafr] No AJAX nonce found`);
+          parsedEpisodes = parseEpisodes(currentHtml);
+        }
+        if (!parsedEpisodes || parsedEpisodes.length === 0) {
+          const nonce = extractNonce(currentHtml);
+          const seasonId = targetSeason.id;
+          if (!nonce || !seasonId) {
+            console.warn(`[Wookafr] No AJAX nonce or season id found`);
             return [];
           }
           const ajaxData = yield postForm(
             `${SITE.BASE_URL}/wp-admin/admin-ajax.php`,
-            { action: "getepisodes", season_id: targetSeason.id, nonce },
+            { action: "getepisodes", season_id: seasonId, nonce },
             { timeout: TIMEOUTS.AJAX }
           );
           const ajaxHtml = (_a = ajaxData == null ? void 0 : ajaxData.data) == null ? void 0 : _a.html;
@@ -14705,35 +14920,36 @@ var __provider = (() => {
             return [];
           }
           parsedEpisodes = parseEpisodes(ajaxHtml);
+          currentHtml = ajaxHtml;
         }
         if (parsedEpisodes.length === 0) {
           console.warn(`[Wookafr] No episodes for season ${targetSeasonNum}`);
           return [];
         }
         const seasonEpisodes = parsedEpisodes.filter((e) => e.season === targetSeasonNum);
+        if (seasonEpisodes.length === 0) {
+          console.warn(`[Wookafr] No episodes tagged season ${targetSeasonNum} (AJAX returned other season?)`);
+          return [];
+        }
         let ep = null;
         for (const epNum of targetEpisodeNums) {
           ep = seasonEpisodes.find((e) => e.episode === epNum);
           if (ep) break;
         }
-        if (!ep) ep = seasonEpisodes[targetEpisodeNums[0] - 1];
         if (!ep) {
-          console.warn(`[Wookafr] Episode ${targetEpisodeNums[0]} not found in season ${targetSeasonNum}`);
+          console.warn(`[Wookafr] Episode ${targetEpisodeNums[0]} not found in season ${targetSeasonNum} (${seasonEpisodes.length} episodes available)`);
           return [];
         }
         console.log(`[Wookafr] Episode: S${ep.season}E${ep.episode} -> ${ep.link}`);
         const epHtml = yield fetchText(ep.link, { timeout: TIMEOUTS.PAGE });
-        const iframeUrl = extractIframeUrl(epHtml);
-        if (!iframeUrl) {
-          console.warn(`[Wookafr] No iframe on episode page`);
+        const candidates = yield collectEmbedCandidates(epHtml, ep.link);
+        if (candidates.length === 0) {
+          console.warn(`[Wookafr] No embed candidates on episode page`);
           return [];
         }
-        const lang = detectLanguage(ep.link, epHtml);
-        const quality = detectQuality(iframeUrl, ep.title);
-        console.log(`[Wookafr] Iframe: ${iframeUrl} [${lang}]`);
-        const stream = toStream(iframeUrl, lang, "Wookafr", SITE.BASE_URL, { quality, subType });
-        const resolved = yield withTimeout(resolveStream(stream), 2e4);
-        if (resolved && resolved.url) return [__spreadProps(__spreadValues({}, resolved), { provider: "wookafr" })];
+        console.log(`[Wookafr] Episode: ${candidates.length} serveur(s) trouv\xE9(s)`);
+        const streams = yield resolveCandidates(candidates, SITE.BASE_URL, subType, startTime, budgetMs, { signal });
+        if (streams.length > 0) return streams;
       } catch (e) {
         console.warn(`[Wookafr] Series extraction failed: ${e.message}`);
       }

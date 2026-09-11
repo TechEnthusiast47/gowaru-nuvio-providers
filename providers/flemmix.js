@@ -1,6 +1,6 @@
 /**
  * flemmix - Built from src/flemmix/
- * Generated: 2026-09-10T22:03:02.859782808Z
+ * Generated: 2026-09-11T02:26:55.451615406Z
  */
 var __provider = (() => {
   var __create = Object.create;
@@ -562,7 +562,14 @@ var __provider = (() => {
       const start = Date.now();
       const SLOW_THRESHOLD = 15e3;
       const method = (options.method || "GET").toUpperCase();
-      const cacheKey = method + "|" + url;
+      let headerTag = "";
+      if (options.headers && typeof options.headers === "object") {
+        const keys = Object.keys(options.headers).sort();
+        if (keys.length) {
+          headerTag = "|" + keys.map((k) => `${k.toLowerCase()}=${String(options.headers[k]).slice(0, 80)}`).join("&");
+        }
+      }
+      const cacheKey = method + "|" + url + headerTag;
       if (method === "GET") {
         const cached = getCachedFetch(cacheKey);
         if (cached) {
@@ -913,6 +920,7 @@ var __provider = (() => {
       const fallbackDomains = [originalDomain];
       if (originalDomain.endsWith(".bz")) fallbackDomains.push("uqload.co", "uqload.to");
       if (originalDomain.endsWith(".to")) fallbackDomains.push("uqload.co");
+      if (originalDomain.endsWith(".cx")) fallbackDomains.push("uqload.co", "uqload.vc");
       const uniqueDomains = [...new Set(fallbackDomains)];
       const EXPIRED_MARKERS = [
         "file is no longer available",
@@ -923,40 +931,41 @@ var __provider = (() => {
         const low = html.toLowerCase();
         return EXPIRED_MARKERS.some((m) => low.includes(m));
       };
-      return new Promise((resolve) => {
-        let failures = 0;
-        let resolved = false;
-        const checkDomain = (domain) => __async(null, null, function* () {
+      const isRestrictedStub = (html) => html.length < 200 && /restricted for this domain/i.test(html);
+      const refererChain = [
+        `https://${uniqueDomains[0]}/`,
+        // self (comportement historique, autres providers)
+        "https://lecteurvideo.com/",
+        // parent lecteurvideo (chaîne wookafr)
+        ""
+        // sans Referer
+      ];
+      const extractFile = (content) => content.match(/file\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/i) || content.match(/sources\s*:\s*\[[^\]]*?\{[^}]*?file\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/i) || content.match(/sources\s*:\s*\[["']([^"']+\.(?:mp4|m3u8)[^"']*)["']\]/i) || content.match(/["'](https?:\/\/[^"']*\/hls\d?\/[^"']*\.m3u8[^"']*)["']/i) || content.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)["']/i);
+      for (const domain of uniqueDomains) {
+        const tryUrl = `https://${domain}${normalizedPath}`;
+        for (const referer of refererChain) {
           try {
-            const tryUrl = `https://${domain}${normalizedPath}`;
-            const ref = `https://${domain}/`;
-            const res = yield safeFetch(tryUrl, { headers: __spreadProps(__spreadValues({}, HEADERS), { "Referer": ref }) });
-            if (res) {
-              const html = yield res.text();
-              if (isExpiredPage(html) && !resolved) {
-                resolved = true;
-                console.warn(`[Resolver] uqload embed dead (expired/deleted): ${url.slice(0, 80)}`);
-                resolve({ url, isDead: true });
-                return;
-              }
-              let content = html;
-              if (content.includes("p,a,c,k,e,d") || content.includes("eval(function")) content = unpack(content);
-              const match = content.match(/sources\s*:\s*\[[^\]]*?\{[^}]*?file\s*:\s*["']([^"']+\.(?:mp4|m3u8))["']/i) || content.match(/sources\s*:\s*\[["']([^"']+\.(?:mp4|m3u8))["']\]/i) || content.match(/file\s*:\s*["']([^"']+\.(?:mp4|m3u8))["']/i);
-              if (match && !resolved) {
-                resolved = true;
-                resolve({ url: match[1], headers: { "Referer": ref } });
-                return;
-              }
+            const headers = __spreadValues({}, HEADERS);
+            if (referer) headers["Referer"] = referer;
+            const res = yield safeFetch(tryUrl, { headers });
+            if (!res) continue;
+            let html = yield res.text();
+            if (isExpiredPage(html)) {
+              console.warn(`[Resolver] uqload embed dead (expired/deleted): ${url.slice(0, 80)}`);
+              return { url, isDead: true };
+            }
+            if (isRestrictedStub(html) || !html.includes("p,a,c,k,e,d") && !html.includes("eval(function") && !extractFile(html)) continue;
+            if (html.includes("p,a,c,k,e,d") || html.includes("eval(function")) html = unpack(html);
+            const match = extractFile(html);
+            if (match) {
+              const playHeaders = { "Referer": `https://${domain}/` };
+              return { url: match[1], headers: playHeaders };
             }
           } catch (e) {
           }
-          failures++;
-          if (failures === uniqueDomains.length && !resolved) {
-            resolve({ url });
-          }
-        });
-        uniqueDomains.forEach(checkDomain);
-      });
+        }
+      }
+      return { url };
     });
   }
   function resolveVoe(url) {
@@ -1495,7 +1504,7 @@ var __provider = (() => {
           if (knownSlowHost || deadEmbed) {
             return __spreadProps(__spreadValues({}, stream), { isDirect: false });
           }
-          const skipDirectScan = result && result.url === originalUrl && depth === 0;
+          let skipDirectScan = result && result.url === originalUrl && depth === 0;
           const res = yield safeFetch(originalUrl, { headers: stream.headers });
           if (res) {
             let html = yield res.text();
@@ -1516,7 +1525,9 @@ var __provider = (() => {
               console.log(`[Resolver] Peeling: Found nested iframe -> ${iframeUrl}`);
               const peeledResult = yield resolveStream(__spreadProps(__spreadValues({}, stream), { url: iframeUrl }), depth + 1);
               if (peeledResult && peeledResult.isDirect) return peeledResult;
-              if (depth > 0) return peeledResult;
+              if (depth > 0) {
+                skipDirectScan = false;
+              }
             }
             if (!skipDirectScan) {
               const strictUrl = html.match(/file\s*:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/i) || html.match(/sources\s*:\s*\[["']([^"']+\.(?:m3u8|mp4)[^"']*)["']\]/i) || html.match(/'hls'\s*:\s*'([^']+)'/) || html.match(/"hls"\s*:\s*"([^"]+)"/);
@@ -1567,7 +1578,7 @@ var __provider = (() => {
       PROVIDER_BUDGET_MS = 45e3;
       MAX_STREAMS_PER_PROVIDER = 80;
       MAX_SAFE_FETCH_BODY_BYTES = 1024 * 1024;
-      BUILD_HASH = true ? "41210d4f" : "dev";
+      BUILD_HASH = true ? "3344d314" : "dev";
       HAS_NATIVE_CRYPTO = typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
       _nodeCrypto = null;
       try {
@@ -1726,7 +1737,11 @@ var __provider = (() => {
         DOMAIN: "flemmix.me"
       };
       ENDPOINTS = {
-        SEARCH: `${SITE.BASE_URL}/search?q=`
+        SEARCH: `${SITE.BASE_URL}/search?q=`,
+        // Sitemaps publics mis à jour quotidiennement (fallback si la recherche échoue)
+        SITEMAP_INDEX: `${SITE.BASE_URL}/sitemap.xml`,
+        SITEMAP_MOVIES: `${SITE.BASE_URL}/sitemap-movies-1.xml`,
+        SITEMAP_TVSHOWS: `${SITE.BASE_URL}/sitemap-tvshows-1.xml`
       };
       SELECTORS = {
         SEARCH_JSON: null,
@@ -1748,7 +1763,7 @@ var __provider = (() => {
         SERIES_EPISODE_TITLE: ".episode-title",
         EPISODE_PLAYER_TABS: "button.episode-server-tab",
         EPISODE_PLAYER_MOUNT: "#episode-player-mount",
-        EPISODE_PLAYER_CONTAINER: "#episode-player-container",
+        EPISODE_PLAYER_CONTAINER: "#player-container",
         EPISODE_QUALITY_PILL: ".quality-pill",
         EPISODE_LANG_PILL: ".lang-pill",
         TAB_DATA_URL: "data-url",
@@ -1757,8 +1772,10 @@ var __provider = (() => {
         PLAYER_IFRAME: 'iframe[src*="minochinos"]'
       };
       PATTERNS = {
-        SEASON_LINK: /\/saison-(\d+)$/i,
-        EPISODE_LINK: /\/(\d+)x(\d+)$/i,
+        // Pages saison : /{slug}-{id}/saison-{n} (ex: /house-of-the-dragon-04/saison-2)
+        SEASON_LINK: /\/saison-(\d+)(?:-vf|-vostfr)?$/i,
+        // Pages épisode : /{slug}/{s}x{e} (ex: /house-of-the-dragon/3x2) — slug SANS suffixe id
+        EPISODE_LINK: /\/([a-z0-9-]+)\/(\d+)x(\d+)$/i,
         IMDB_ID: /tt(\d+)/,
         TMDB_IMAGE: /image\.tmdb\.org\/t\/p\/[^/]+\/([a-zA-Z0-9]+)\.jpg/
       };
@@ -14244,6 +14261,9 @@ var __provider = (() => {
   });
 
   // src/flemmix/extractor.js
+  function isJapanese(text) {
+    return /[\u3000-\u9FFF\uF900-\uFAFF]/.test(text || "");
+  }
   function scoreMatch(resultTitle, searchTitle) {
     const nt = normalize(searchTitle);
     const nr = normalize(resultTitle);
@@ -14278,28 +14298,71 @@ var __provider = (() => {
     }
     return bestScore >= SCORES.MIN_MATCH ? best : null;
   }
-  function parseServerTabs($, tabSelector, qualitySelector, langSelector) {
+  function parseServerTabs($, tabSelector) {
     const servers = [];
     $(tabSelector).each((_, el) => {
       const $tab = $(el);
       const url = $tab.attr(SELECTORS.TAB_DATA_URL);
       if (!url) return;
+      const absUrl = url.startsWith("http") ? url.replace(/&amp;/g, "&") : `${SITE.BASE_URL}${url}`.replace(/&amp;/g, "&");
       const isActive = ($tab.attr("class") || "").split(/\s+/).includes(SELECTORS.TAB_ACTIVE);
-      const quality = $tab.find(qualitySelector).first().text().trim() || "HD";
-      const langRaw = $tab.find(langSelector).first().text().trim().toLowerCase();
-      const lang = LANGUAGE_MAP[langRaw] || "VF";
-      servers.push({ url, quality, language: lang, isActive });
+      const tabText = $tab.text().toLowerCase();
+      const langRaw = ($tab.find(SELECTORS.MOVIE_LANG_PILL).first().text() || "").trim().toLowerCase();
+      let language;
+      if (LANGUAGE_MAP[langRaw]) {
+        language = LANGUAGE_MAP[langRaw];
+      } else if (/vostfr/.test(tabText) && !/vo\b/.test(tabText.replace("vostfr", ""))) {
+        language = "VOSTFR";
+      } else if (/(?:^|\s)vf(?:\s|$)|version fran/.test(tabText)) {
+        language = "VF";
+      } else if (/vostfr/.test(tabText)) {
+        language = "VOSTFR";
+      } else if (absUrl.includes("ds_lang=fr")) {
+        language = "VF";
+      } else if (/french/.test(absUrl.toLowerCase())) {
+        language = "VF";
+      } else {
+        language = "VOSTFR";
+      }
+      const qualityText = ($tab.find(SELECTORS.MOVIE_QUALITY_PILL).first().text() || "").trim();
+      servers.push({
+        url: absUrl,
+        quality: qualityText ? qualityText.toUpperCase() : "HD",
+        language,
+        isActive
+      });
     });
     return servers;
   }
   function parseSearchResults(json) {
     if (!Array.isArray(json)) return [];
     return json.map((item) => ({
-      url: `${SITE.BASE_URL}${item.url}`,
+      url: `${SITE.BASE_URL}${item.url}`.replace(/&amp;/g, "&"),
       title: item.title,
       isSeries: item.type === "tvshow",
       year: item.year
     }));
+  }
+  function trySearchBilingual(titles, filterSeries) {
+    return __async(this, null, function* () {
+      for (const title of titles.slice(0, MAX_SEARCH_TITLES)) {
+        const probes = [
+          `${ENDPOINTS.SEARCH}${encodeURIComponent(title)}`,
+          `${ENDPOINTS.SEARCH}${encodeURIComponent(`${title} VOSTFR`)}`
+        ];
+        const settled = yield Promise.allSettled(probes.map((p) => fetchJson(p, { timeout: TIMEOUTS.SEARCH })));
+        for (const r of settled) {
+          if (r.status !== "fulfilled") continue;
+          const results = parseSearchResults(r.value);
+          if (results.length === 0) continue;
+          const filtered = filterSeries ? results.filter((x) => x.isSeries) : results.filter((x) => !x.isSeries);
+          const candidates = filtered.length > 0 ? filtered : results;
+          const match = bestMatch(candidates, title);
+          if (match) return match;
+        }
+      }
+      return null;
+    });
   }
   function parseSeasons(html) {
     const $ = import_cheerio_without_node_native2.default.load(html);
@@ -14311,7 +14374,7 @@ var __provider = (() => {
       if (m) {
         seasons.push({
           num: parseInt(m[1]),
-          link: `${SITE.BASE_URL}${href}`,
+          link: `${SITE.BASE_URL}${href}`.replace(/&amp;/g, "&"),
           title: $card.find(SELECTORS.SERIES_SEASON_TITLE).first().text().trim() || $card.text().trim()
         });
       }
@@ -14327,9 +14390,10 @@ var __provider = (() => {
       const m = href.match(PATTERNS.EPISODE_LINK);
       if (m) {
         episodes.push({
-          season: parseInt(m[1]),
-          episode: parseInt(m[2]),
-          link: `${SITE.BASE_URL}${href}`,
+          // Le slug de l'épisode est sans suffixe id : /{slug}/{s}x{e}
+          season: parseInt(m[2]),
+          episode: parseInt(m[3]),
+          link: `${SITE.BASE_URL}${href}`.replace(/&amp;/g, "&"),
           title: $card.find(SELECTORS.SERIES_EPISODE_TITLE).first().text().trim()
         });
       }
@@ -14359,7 +14423,7 @@ var __provider = (() => {
         const genres = (details.genres || []).map((g) => g.id);
         const isAnim = genres.includes(ANIME_GENRE_ID);
         const orig = mediaType === "movie" ? details.original_title : details.original_name;
-        const jap = /[\u3000-\u9FFF\uF900-\uFAFF]/.test(orig || "");
+        const jap = isJapanese(orig || "");
         const keywordMatch = titles.some((t) => ANIME_KEYWORDS.test(t));
         if (isAnim && (jap || keywordMatch)) return "anime";
         return null;
@@ -14368,29 +14432,41 @@ var __provider = (() => {
       }
     });
   }
-  function trySearch(titles, filterSeries) {
+  function trySitemap(titles, filterSeries) {
     return __async(this, null, function* () {
-      for (const title of titles.slice(0, MAX_SEARCH_TITLES)) {
-        try {
-          const url = `${ENDPOINTS.SEARCH}${encodeURIComponent(title)}`;
-          const json = yield fetchJson(url, { timeout: TIMEOUTS.SEARCH });
-          const results = parseSearchResults(json);
-          if (results.length === 0) continue;
-          const filtered = filterSeries ? results.filter((r) => r.isSeries) : results.filter((r) => !r.isSeries);
-          const candidates = filtered.length > 0 ? filtered : results;
-          const match = bestMatch(candidates, title);
-          if (match) return match;
-        } catch (e) {
-          console.warn(`[Flemmix] Search failed for "${title}": ${e.message}`);
+      try {
+        const sitemapUrl = filterSeries ? ENDPOINTS.SITEMAP_TVSHOWS : ENDPOINTS.SITEMAP_MOVIES;
+        const xml = yield withCache(`sm_${filterSeries ? "tv" : "mv"}`, () => fetchText(sitemapUrl, { timeout: TIMEOUTS.SEARCH }), { successTtl: 18e5, failureTtl: 6e4 });
+        if (!xml) return null;
+        const items = [];
+        const re = /<loc>\s*([^<]+?)\s*<\/loc>/g;
+        let m;
+        while ((m = re.exec(xml)) !== null) {
+          const loc = m[1];
+          const parts = loc.replace(/\/$/, "").split("/");
+          const slug = parts[parts.length - 1] || "";
+          if (!slug) continue;
+          items.push({
+            url: loc,
+            title: slug.replace(/-\d{2,}$/, "").replace(/-vf$|-vostfr$/i, "").replace(/-/g, " "),
+            isSeries: filterSeries
+          });
         }
+        if (items.length === 0) return null;
+        for (const title of titles.slice(0, MAX_SEARCH_TITLES)) {
+          const match = bestMatch(items, title);
+          if (match) return match;
+        }
+      } catch (e) {
+        console.warn(`[Flemmix] Sitemap fallback failed: ${e.message}`);
       }
       return null;
     });
   }
-  function resolveWithTimeout(stream) {
+  function resolveWithTimeout(stream, timeoutMs = 14e3) {
     return __async(this, null, function* () {
       try {
-        const resolved = yield resolveStream(stream);
+        const resolved = yield withTimeout(resolveStream(stream), timeoutMs);
         if (resolved && resolved.url && resolved.isDirect) return resolved;
         return null;
       } catch (e) {
@@ -14403,14 +14479,17 @@ var __provider = (() => {
       const results = yield Promise.allSettled(
         servers.map((server) => __async(null, null, function* () {
           const stream = toStream(server.url, server.language || "VF", name, SITE.BASE_URL, { quality: server.quality || "HD", subType });
+          if (/flemmix\.me\/embed\//.test(server.url)) {
+            stream.headers = __spreadProps(__spreadValues({}, stream.headers), { Referer: `${SITE.BASE_URL}/`, Origin: SITE.BASE_URL });
+          }
           const resolved = yield resolveWithTimeout(stream);
-          if (resolved && resolved.url) {
+          if (resolved && resolved.url && resolved.isDirect) {
             return __spreadProps(__spreadValues({}, resolved), { provider: "flemmix" });
           }
-          return __spreadProps(__spreadValues({}, stream), { provider: "flemmix" });
+          return null;
         }))
       );
-      return results.filter((r) => r.status === "fulfilled").map((r) => r.value).filter((s) => s && s.isDirect);
+      return results.filter((r) => r.status === "fulfilled").map((r) => r.value).filter(Boolean);
     });
   }
   function extractStreams(_0, _1, _2, _3) {
@@ -14418,6 +14497,7 @@ var __provider = (() => {
       const signal = (options == null ? void 0 : options.signal) || null;
       if (isAborted(signal)) return [];
       setCurrentSignal(signal);
+      const isTv = mediaType === "series" || mediaType === "tv";
       const rawTitles = yield getTmdbTitles(tmdbId, mediaType, { season });
       if (!rawTitles || rawTitles.length === 0) return [];
       const titles = rawTitles.map((t) => stripSeasonSuffix(t));
@@ -14426,47 +14506,15 @@ var __provider = (() => {
       const subType = yield detectSubType(tmdbId, mediaType, titles);
       if (subType) console.log(`[Flemmix] Detected subtype: ${subType}`);
       if (isAborted(signal)) return [];
-      if (mediaType === "movie") {
+      if (!isTv) {
         return extractMovie(tmdbId, titles, subType);
       }
       return extractSeries(tmdbId, mediaType, titles, season, episode, subType);
     });
   }
-  function browseCategory(mediaType, titles) {
-    return __async(this, null, function* () {
-      const baseType = mediaType === "movie" ? "films" : "series";
-      const linkPattern = mediaType === "movie" ? "/film/" : "/serie/";
-      const url = `${SITE.BASE_URL}/${baseType}`;
-      try {
-        const html = yield fetchText(url, { timeout: TIMEOUTS.PAGE });
-        const $ = import_cheerio_without_node_native2.default.load(html);
-        const items = [];
-        $(`a[href*="${linkPattern}"]`).each((i, el) => {
-          const href = $(el).attr("href") || "";
-          const title = $(el).text().trim() || $(el).find("img").first().attr("alt") || "";
-          if (href && title) {
-            items.push({
-              url: href.startsWith("http") ? href : `${SITE.BASE_URL}${href}`,
-              title
-            });
-          }
-        });
-        if (items.length === 0) return null;
-        console.log(`[Flemmix] Browsing ${baseType}: ${items.length} items`);
-        for (const title of titles.slice(0, MAX_SEARCH_TITLES)) {
-          const match = bestMatch(items, title);
-          if (match) return match;
-        }
-        return null;
-      } catch (e) {
-        console.warn(`[Flemmix] Category browse failed: ${e.message}`);
-        return null;
-      }
-    });
-  }
   function extractMovie(tmdbId, titles, subType) {
     return __async(this, null, function* () {
-      const match = (yield trySearch(titles, false)) || (yield browseCategory("movie", titles));
+      const match = (yield trySearchBilingual(titles, false)) || (yield trySitemap(titles, false));
       if (!match) {
         console.warn(`[Flemmix] Movie not found for TMDB ${tmdbId}`);
         return [];
@@ -14475,16 +14523,12 @@ var __provider = (() => {
       try {
         const pageHtml = yield fetchText(match.url, { timeout: TIMEOUTS.PAGE });
         const $ = import_cheerio_without_node_native2.default.load(pageHtml);
-        const servers = parseServerTabs(
-          $,
-          SELECTORS.MOVIE_PLAYER_TABS,
-          SELECTORS.MOVIE_QUALITY_PILL,
-          SELECTORS.MOVIE_LANG_PILL
-        );
+        const servers = parseServerTabs($, SELECTORS.MOVIE_PLAYER_TABS);
         if (servers.length === 0) {
           console.warn(`[Flemmix] No servers on ${match.url}`);
           return [];
         }
+        console.log(`[Flemmix] Movie: ${servers.length} serveur(s) [${servers.map((s) => s.language).join(", ")}]`);
         return yield createStreamsFromServers(servers, "Flemmix", subType);
       } catch (e) {
         console.warn(`[Flemmix] Movie extraction failed: ${e.message}`);
@@ -14496,8 +14540,8 @@ var __provider = (() => {
     return __async(this, null, function* () {
       const effectiveSeason = titles.effectiveSeason != null ? titles.effectiveSeason : season;
       const targetSeasonNum = parseInt(effectiveSeason) || 1;
-      const targetEpisodeNums = yield resolveTargetEpisodes(tmdbId, mediaType, season, episode);
-      const match = (yield trySearch(titles, true)) || (yield browseCategory("tv", titles));
+      const targetEpisodeNums = yield resolveTargetEpisodes(tmdbId, "tv", season, episode);
+      const match = (yield trySearchBilingual(titles, true)) || (yield trySitemap(titles, true));
       if (!match) {
         console.warn(`[Flemmix] Series not found for TMDB ${tmdbId}`);
         return [];
@@ -14510,7 +14554,11 @@ var __provider = (() => {
           console.warn(`[Flemmix] No seasons on series page`);
           return [];
         }
-        const targetSeason = seasons.find((s) => s.num === targetSeasonNum) || seasons[0];
+        const targetSeason = seasons.find((s) => s.num === targetSeasonNum);
+        if (!targetSeason) {
+          console.warn(`[Flemmix] Season ${targetSeasonNum} not found on site (available: ${seasons.map((s) => s.num).join(", ")})`);
+          return [];
+        }
         console.log(`[Flemmix] Selected season: ${targetSeason.num} -> ${targetSeason.link}`);
         const seasonHtml = yield fetchText(targetSeason.link, { timeout: TIMEOUTS.PAGE });
         const episodes = parseSeasonEpisodes(seasonHtml);
@@ -14520,27 +14568,22 @@ var __provider = (() => {
         }
         let ep = null;
         for (const epNum of targetEpisodeNums) {
-          ep = episodes.find((e) => e.episode === epNum);
+          ep = episodes.find((e) => e.season === targetSeasonNum && e.episode === epNum);
           if (ep) break;
         }
-        if (!ep) ep = episodes[targetEpisodeNums[0] - 1];
         if (!ep) {
-          console.warn(`[Flemmix] Episode ${targetEpisodeNums[0]} not found in season ${targetSeasonNum}`);
+          console.warn(`[Flemmix] Episode ${targetEpisodeNums[0]} not found in season ${targetSeasonNum} (${episodes.length} episodes available)`);
           return [];
         }
         console.log(`[Flemmix] Episode: S${ep.season}E${ep.episode} -> ${ep.link}`);
         const epHtml = yield fetchText(ep.link, { timeout: TIMEOUTS.PAGE });
         const $ = import_cheerio_without_node_native2.default.load(epHtml);
-        const servers = parseServerTabs(
-          $,
-          SELECTORS.EPISODE_PLAYER_TABS,
-          SELECTORS.EPISODE_QUALITY_PILL,
-          SELECTORS.EPISODE_LANG_PILL
-        );
+        const servers = parseServerTabs($, SELECTORS.EPISODE_PLAYER_TABS);
         if (servers.length === 0) {
           console.warn(`[Flemmix] No servers on episode page`);
           return [];
         }
+        console.log(`[Flemmix] Episode: ${servers.length} serveur(s) [${servers.map((s) => s.language).join(", ")}]`);
         return yield createStreamsFromServers(servers, "Flemmix", subType);
       } catch (e) {
         console.warn(`[Flemmix] Series extraction failed: ${e.message}`);
