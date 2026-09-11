@@ -517,7 +517,7 @@
     {
       "id": "streamzo",
       "name": "StreamZo",
-      "description": "Films et séries en streaming VF/VOSTFR sur Streamzo.fr (SPA, iframe injecté, multi-serveurs).",
+      "description": "Films et séries en streaming VF/VOSTFR sur Streamzo.fr (recherche par suggestion, langues multi-sources).",
       "version": "1.0.3",
       "author": "Gowaru",
       "supportedTypes": [

@@ -1,345 +1,395 @@
-import { fetchText, setCurrentSignal } from './http.js'
-import { SITE, TIMEOUTS } from './config.js'
+/**
+ * Extractor Streamzo (streamzo.fr)
+ *
+ * Refonte :
+ * - Recherche via l'API de suggestion du site (/api/web/suggest) qui renvoie
+ *   l'href EXACT (film ou série), le kind, le titre, l'année et la qualité.
+ *   L'ancienne génération de slugs (6 candidats × 2 chemins) ratait la majorité
+ *   du catalogue et provoquait des mismatches.
+ * - Décodage des échappements unicode (\u0026) : les master.m3u8 des embeds sont
+ *   sérialisés en JSON, donc l'URL brute contenait des « \u0026 » littéraux et
+ *   ne se lançait jamais dans le lecteur.
+ * - Langues : data-lang des boutons d'épisode (vf / vostfr), plus de détection
+ *   hasardeuse sur le HTML de la page.
+ * - Aucun embed non résolu n'est retourné (convention : uniquement du jouable).
+ */
+import { fetchText, fetchJson, setCurrentSignal } from './http.js'
+import { SITE, TIMEOUTS, LIMITS } from './config.js'
 import { getTmdbTitles } from '../utils/metadata.js'
 import { resolveStream, isAborted, isBudgetExhausted, PROVIDER_BUDGET_MS } from '../utils/resolvers.js'
 import { toSlug } from '../utils/dle-extractor.js'
+import { createCache } from '../utils/cache.js'
+
+const withCache = createCache('szs', 'Streamzo', { successTtl: 10 * 60_000, failureTtl: 30_000, maxSize: 120 })
+
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36'
+
+// ─── Helpers texte / scoring ────────────────────────────────────────────────
+
+/** Normalise pour comparaison : minuscules, sans accents ni ponctuation. */
+function normalizeForMatch(value) {
+  if (!value) return ''
+  return String(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function tokensOf(value) {
+  return normalizeForMatch(value).split(' ').filter(Boolean)
+}
 
 /**
- * Extrait l'URL embed depuis la page d'un film
- * La page contient: <iframe id="video-frame" src="/embed/sharecloudy.com/ID">
+ * Score de similarité entre un titre TMDB et une suggestion du site.
+ * 0 = aucun rapport. Utilise inclusion + recouvrement de tokens.
+ */
+function titleScore(wanted, candidate) {
+  const a = normalizeForMatch(wanted)
+  const b = normalizeForMatch(candidate)
+  if (!a || !b) return 0
+  if (a === b) return 100
+  if (b === `${a} vostfr`) return 95
+  if (a.length >= 5 && (b.includes(a) || a.includes(b))) return 70
+  const ta = tokensOf(a)
+  const tb = tokensOf(b)
+  if (!ta.length || !tb.length) return 0
+  let common = 0
+  for (const t of ta) if (tb.includes(t)) common++
+  const ratio = common / Math.max(ta.length, tb.length)
+  if (ratio >= 0.6) return Math.round(40 + ratio * 30)
+  if (ratio >= 0.4) return 25
+  return 0
+}
+
+/**
+ * Score global d'une suggestion : titre (meilleur des titres TMDB) + année + type.
+ * Un mauvais `kind` est fortement pénalisé pour éviter film ↔ série.
+ */
+function scoreSuggestion(titles, suggestedYear, suggestion, wantSeries) {
+  let best = 0
+  const suggestionTitles = [suggestion.titre, suggestion.slug?.replace(/-/g, ' ')]
+  for (const wanted of titles) {
+    if (!wanted) continue
+    for (const cand of suggestionTitles) {
+      const s = titleScore(wanted, cand)
+      if (s > best) best = s
+    }
+  }
+  if (best === 0) return 0
+
+  const isSeries = suggestion.content_type === 'series' || suggestion.kind === 'series'
+  if (isSeries === wantSeries) best += 25
+  else best -= 60
+
+  const year = parseInt(suggestion.year, 10)
+  const wantedYear = parseInt(suggestedYear, 10)
+  if (year && wantedYear) {
+    const diff = Math.abs(year - wantedYear)
+    if (diff === 0) best += 30
+    else if (diff === 1) best += 15
+    else if (diff > 2) best -= 25
+  }
+  return best
+}
+
+// ─── Recherche ──────────────────────────────────────────────────────────────
+
+function buildQueries(titles) {
+  const queries = []
+  const seen = new Set()
+  for (const t of titles) {
+    if (!t || typeof t !== 'string') continue
+    // Les variantes TMDB ajoutent « Season 1 » : inutile pour une recherche texte
+    const cleaned = t.replace(/\s+(saison|season)\s*\d+$/i, '').trim()
+    if (cleaned.length < 2) continue
+    const key = cleaned.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    queries.push(cleaned)
+    if (queries.length >= LIMITS.MAX_QUERIES) break
+  }
+  return queries
+}
+
+async function suggestFor(query, signal) {
+  const url = `${SITE.SUGGEST_URL}?q=${encodeURIComponent(query)}`
+  return withCache(`suggest_${query.toLowerCase()}`, async () => {
+    const data = await fetchJson(url, { timeout: TIMEOUTS.SUGGEST, retries: 1, signal })
+    const list = Array.isArray(data?.suggestions) ? data.suggestions : []
+    return list.filter(s => s && typeof s.href === 'string' && s.href.startsWith('/'))
+  })
+}
+
+/**
+ * Trouve l'href exact d'un film/série via /api/web/suggest.
+ * @returns {Promise<{href:string, kind:string, lang:string|null, quality:string|null}|null>}
+ */
+async function searchViaSuggest(titles, mediaType, suggestedYear, signal, startTime) {
+  const wantSeries = mediaType === 'tv' || mediaType === 'series'
+  const queries = buildQueries(titles)
+  if (!queries.length) return null
+
+  let best = null
+  let bestScore = 0
+
+  for (const q of queries) {
+    if (isAborted(signal) || isBudgetExhausted(startTime, PROVIDER_BUDGET_MS)) break
+    let list = []
+    try {
+      list = await suggestFor(q, signal)
+    } catch (e) {
+      if (e.name === 'AbortError') return null
+      continue
+    }
+    for (const s of list) {
+      const score = scoreSuggestion(titles, suggestedYear, s, wantSeries)
+      if (score > bestScore) {
+        bestScore = score
+        best = s
+      }
+    }
+    // Un score très élevé est déjà une certitude : inutile d'interroger les autres titres
+    if (bestScore >= 110) break
+  }
+
+  if (!best || bestScore < LIMITS.MIN_SUGGEST_SCORE) {
+    console.log(`[Streamzo] Suggest: aucun résultat suffisant (meilleur score ${bestScore})`)
+    return null
+  }
+
+  const isSeries = best.content_type === 'series' || best.kind === 'series'
+  console.log(`[Streamzo] Suggest: "${best.titre}" → ${best.href} (score ${bestScore})`)
+  return {
+    href: best.href,
+    kind: isSeries ? 'series' : 'movie',
+    title: best.titre || '',
+    quality: best.resolution || best.quality || null,
+  }
+}
+
+/** Dernier recours : ancienne génération de slugs (limitée, l'API est la référence). */
+async function searchViaSlugs(titles, mediaType, signal, startTime) {
+  const wantSeries = mediaType === 'tv' || mediaType === 'series'
+  const slugs = []
+  for (const t of titles) {
+    if (!t) continue
+    const slug = toSlug(t)
+    if (slug && !slugs.includes(slug)) slugs.push(slug)
+    if (slugs.length >= LIMITS.MAX_SLUG_FALLBACK) break
+  }
+
+  for (const slug of slugs) {
+    if (isAborted(signal) || isBudgetExhausted(startTime, PROVIDER_BUDGET_MS)) return null
+    const paths = wantSeries ? [`/series/${slug}`, `/${slug}`] : [`/${slug}`]
+    for (const path of paths) {
+      if (isAborted(signal)) return null
+      const html = await fetchText(`${SITE.BASE_URL}${path}`, { timeout: TIMEOUTS.PAGE, retries: 0, signal })
+      if (!html || html.length < 5000) continue
+      const hasEpisodes = hasSeriesEpisodes(html)
+      if (wantSeries && !hasEpisodes) continue
+      const embedUrl = extractEmbedUrl(html)
+      if (!hasEpisodes && !embedUrl) continue
+      console.log(`[Streamzo] Fallback slug: ${path}`)
+      return { href: path, kind: hasEpisodes ? 'series' : 'movie' }
+    }
+  }
+  return null
+}
+
+// ─── Analyse des pages ──────────────────────────────────────────────────────
+
+/**
+ * Extrait l'URL embed depuis la page d'un film.
+ * Le site utilise <button id="player-facade" data-embed="/embed/host/id">.
  */
 function extractEmbedUrl(html) {
   if (!html) return null
 
-  // Pattern 1: #player-facade with data-embed (nouveau site)
-  // <button id="player-facade" data-embed="/embed/sharecloudy.com/ID">
   const facadeMatch = html.match(/id=["']player-facade["'][^>]*data-embed=["']([^"']+)["']/i)
   if (facadeMatch) return facadeMatch[1]
 
-  // Pattern 2: iframe#video-frame (ancien site)
+  // data-embed peut précéder l'id selon la version du template
+  const facadeReverse = html.match(/data-embed=["']([^"']+)["'][^>]*id=["']player-facade["']/i)
+  if (facadeReverse) return facadeReverse[1]
+
   const iframeMatch = html.match(/<iframe[^>]*id=["']video-frame["'][^>]*src=["']([^"']+)["']/i)
   if (iframeMatch) return iframeMatch[1]
 
-  // Pattern 3: any iframe with src containing /embed/
   const embedMatch = html.match(/<iframe[^>]*src=["']([^"']*\/embed\/[^"']+)["']/i)
   if (embedMatch) return embedMatch[1]
 
-  // Pattern 4: #player container with iframe inside
   const playerMatch = html.match(/id=["']player["'][^>]*>[\s\S]*?<iframe[^>]*src=["']([^"']+)["']/i)
   if (playerMatch) return playerMatch[1]
 
   return null
 }
 
-/**
- * Vérifie si le HTML contient des boutons d'épisode de série
- * (pattern: <button class="sd-ep" ...>).
- */
+/** Détecte la présence de boutons d'épisode (page série). */
 function hasSeriesEpisodes(html) {
   if (!html) return false
-  return /<button[^>]*class="sd-ep"[^>]*>/i.test(html)
+  return /class=["'][^"']*\bsd-ep\b/.test(html)
 }
 
 /**
- * Extrait l'URL embed d'un épisode depuis la page série.
- * Les épisodes sont dans des <button class="sd-ep"> avec data-attributs :
- *   data-season="N" data-lang="vf|vostfr" data-ep="N" data-src="/embed/..."
- * On extrait chaque attribut individuellement pour être insensible à l'ordre.
+ * Recense les variantes (langue) d'un épisode donné.
+ * Les boutons <button class="sd-ep" data-season data-lang data-ep data-src> sont
+ * multi-lignes : on lit chaque attribut indépendamment de l'ordre.
+ * @returns {Array<{embedUrl:string, lang:string}>} triées VF d'abord
  */
-function findSeriesEpisode(html, season, episode) {
-  if (!html) return null
+function findSeriesEpisodes(html, season, episode) {
+  if (!html) return []
 
-  const buttonRegex = /<button[^>]*class="sd-ep"[^>]*>/gi
-  let match
   const targetSeason = parseInt(season, 10)
   const targetEpisode = parseInt(episode, 10)
+  const buttons = html.match(/<button\b[^>]*class=["'][^"']*\bsd-ep\b[^"']*["'][^>]*>/gi) || []
 
-  // Collecter tous les candidats (vf et vostfr)
-  const candidates = []
+  const found = new Map()
+  for (const el of buttons) {
+    const s = el.match(/data-season=["']?(\d+)/i)
+    const e = el.match(/data-ep=["']?(\d+)/i)
+    const src = el.match(/data-src=["']([^"']+)["']/i)
+    if (!s || !e || !src) continue
+    if (parseInt(s[1], 10) !== targetSeason || parseInt(e[1], 10) !== targetEpisode) continue
 
-  while ((match = buttonRegex.exec(html)) !== null) {
-    const el = match[0]
-    const s = el.match(/data-season="(\d+)"/)
-    const e = el.match(/data-ep="(\d+)"/)
-    const l = el.match(/data-lang="([^"]+)"/)
-    const src = el.match(/data-src="([^"]+)"/)
-    if (!s || !e || !l || !src) continue
-
-    candidates.push({
-      season: parseInt(s[1], 10),
-      episode: parseInt(e[1], 10),
-      lang: l[1],
-      embedUrl: src[1],
-    })
+    const langRaw = (el.match(/data-lang=["']([^"']+)["']/i)?.[1] || '').toLowerCase()
+    const lang = langRaw === 'vostfr' ? 'VOSTFR' : langRaw === 'vf' ? 'VF' : (langRaw ? langRaw.toUpperCase() : 'VF')
+    if (!found.has(lang)) found.set(lang, { embedUrl: src[1], lang })
   }
 
-  // Chercher en priorité vf, puis vostfr
-  for (const lang of ['vf', 'vostfr']) {
-    const found = candidates.find(c => c.season === targetSeason && c.episode === targetEpisode && c.lang === lang)
-    if (found) return { embedUrl: found.embedUrl, lang: lang === 'vf' ? 'VF' : 'VOSTFR' }
+  const order = ['VF', 'VOSTFR']
+  const variants = [...found.values()].sort((a, b) => {
+    const ia = order.indexOf(a.lang)
+    const ib = order.indexOf(b.lang)
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib)
+  })
+  return variants.slice(0, LIMITS.MAX_LANGS)
+}
+
+/**
+ * Décode les échappements unicode d'un HTML/JS (\u0026, \u003d, …).
+ * Indispensable : les master.m3u8 des embeds sont sérialisés en JSON, donc
+ * l'URL brute contient « \u0026 » et n'est pas lisible par le lecteur.
+ */
+function decodeUnicodeEscapes(text) {
+  if (!text) return ''
+  return text
+    .replace(/\\u0026/gi, '&')
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&amp;/g, '&')
+    .replace(/\\\//g, '/')
+}
+
+/**
+ * Extrait les URLs de flux candidates de la page embed (master.m3u8 en premier).
+ */
+function extractDirectUrls(embedHtml) {
+  if (!embedHtml) return []
+  const decoded = decodeUnicodeEscapes(embedHtml)
+  const urls = []
+  const seen = new Set()
+
+  const matches = [
+    ...decoded.matchAll(/https?:\/\/[^"'<>\s\\]+\.m3u8[^"'<>\s\\]*/gi),
+    ...decoded.matchAll(/https?:\/\/[^"'<>\s\\]+\.mp4[^"'<>\s\\]*/gi),
+  ]
+  for (const m of matches) {
+    let url = m[0].replace(/[,;]+$/, '')
+    if (!url || seen.has(url)) continue
+    seen.add(url)
+    urls.push(url)
   }
 
-  return null
+  // Les manifests « master » d'abord (multi-qualités), puis les médias directs
+  urls.sort((a, b) => {
+    const ma = /master\.m3u8/i.test(a) ? 0 : /\.m3u8/i.test(a) ? 1 : 2
+    const mb = /master\.m3u8/i.test(b) ? 0 : /\.m3u8/i.test(b) ? 1 : 2
+    return ma - mb
+  })
+  return urls
+}
+
+/** Absolutise une URL relative retournée par la page. */
+function absolutize(url) {
+  if (!url) return null
+  if (url.startsWith('//')) return `https:${url}`
+  if (url.startsWith('/')) return `${SITE.BASE_URL}${url}`
+  if (!/^https?:/i.test(url)) return `${SITE.BASE_URL}/${url}`
+  return url
 }
 
 /**
- * Extrait l'URL video directe depuis la page embed
- * La page embed utilise vidstack et contient une URL .m3u8 directe
+ * Construit l'objet stream final.
+ * `language` porte le label BRUT (VF/VOSTFR) : la dédup de createProvider et
+ * expandStreamQualities s'appuient dessus avant normalisation en code app.
  */
-function extractDirectUrl(embedHtml) {
-  if (!embedHtml) return null
-
-  // Pattern 1: URL .m3u8 dans le HTML
-  const hlsMatch = embedHtml.match(/https?:[^"'<>]+\.m3u8[^"'<>]*/)
-  if (hlsMatch) return hlsMatch[0]
-
-  // Pattern 2: URL .mp4 directe
-  const mp4Match = embedHtml.match(/https?:[^"'<>]+\.mp4[^"'<>]*/)
-  if (mp4Match) return mp4Match[0]
-
-  // Pattern 3: src d'iframe dans l'embed
-  const iframeMatch = embedHtml.match(/<iframe[^>]*src=["']([^"']+)["']/i)
-  if (iframeMatch) return iframeMatch[1]
-
-  return null
+function buildStream(url, quality, lang) {
+  const label = lang || 'VF'
+  const resolvedQuality = quality && /\d{3,4}p/.test(quality) ? quality : (quality || 'HD')
+  return {
+    name: `Streamzo (${label})`,
+    title: `Streamzo [${label}]${resolvedQuality !== 'HD' ? ` - ${resolvedQuality}` : ''}`,
+    url,
+    quality: resolvedQuality,
+    language: label,
+    type: /\.m3u8/i.test(url) ? 'hls' : /\.mp4/i.test(url) ? 'mp4' : undefined,
+    headers: {
+      Referer: `${SITE.BASE_URL}/`,
+      'User-Agent': USER_AGENT,
+    },
+  }
 }
 
 /**
- * Extrait la qualite depuis la page du film
+ * Résout un embed du site en flux jouable.
+ * Retourne null si aucun flux exploitable (jamais d'embed brut : ExoPlayer ne
+ * sait pas lire une page HTML, les apps afficheraient une source morte).
  */
-function extractQuality(html) {
-  if (!html) return 'HD'
-  const qMatch = html.match(/q\s*--(?:good|bad)\s*["']?\s*>\s*(\d+p)/i)
-  if (qMatch) return qMatch[1]
-  return 'HD'
-}
-
-/**
- * Cherche un film/serie sur streamzo.fr
- * Strategie: TMDB titles → slug → page fetch → iframe extraction
- *
- * @param {string[]} titles - Titres TMDB
- * @param {'movie'|'tv'} mediaType
- * @param {number|string} season
- * @param {object} [opts]
- * @param {AbortSignal} [opts.signal] - Signal d'annulation
- * @param {number} [opts.startTime] - Timestamp début pour budget check
- */
-async function findContent(titles, mediaType, season, opts = {}) {
-  const signal = opts.signal || null
-  const startTime = opts.startTime || Date.now()
-  const year = titles._metadata?.year || ''
-
-  // Vérifier l'abort avant de commencer
+async function resolveEmbedToStream(embedUrl, quality, lang, signal, startTime) {
   if (isAborted(signal)) return null
+  const fullEmbedUrl = absolutize(embedUrl)
+  if (!fullEmbedUrl) return null
 
-  // Generer les slugs depuis tous les titres TMDB
-  // Priorite: slug exact → slug+annee → mots-cles → japonais compacte
-  const seenSlugs = new Set()
-  const slugCandidates = []
-
-  // Limiter la génération à 10 slugs max pour éviter la surcharge
-  const MAX_GENERATED_SLUGS = 10
-
-  for (const title of titles) {
-    if (slugCandidates.length >= MAX_GENERATED_SLUGS) break
-    if (isAborted(signal)) return null
-    if (!title) continue
-    const baseSlug = toSlug(title)
-    if (!baseSlug || seenSlugs.has(baseSlug)) continue
-    seenSlugs.add(baseSlug)
-    slugCandidates.push(baseSlug)
-
-    // Variante avec annee (ex: 12-hommes-en-colere-1957)
-    if (year && !seenSlugs.has(baseSlug + '-' + year)) {
-      seenSlugs.add(baseSlug + '-' + year)
-      slugCandidates.push(baseSlug + '-' + year)
-    }
-
-    // Variantes par mots-cles distinctifs
-    const words = title.split(/\s+/).filter(w => w.length >= 4)
-    if (words.length >= 2) {
-      const lastTwo = words.slice(-2).join('-')
-      const lastTwoSlug = toSlug(lastTwo)
-      if (lastTwoSlug && lastTwoSlug !== baseSlug && !seenSlugs.has(lastTwoSlug)) {
-        seenSlugs.add(lastTwoSlug)
-        slugCandidates.push(lastTwoSlug)
-      }
-      const firstThree = words.slice(0, 3).join('-')
-      const firstThreeSlug = toSlug(firstThree)
-      if (firstThreeSlug && firstThreeSlug !== baseSlug && !seenSlugs.has(firstThreeSlug)) {
-        seenSlugs.add(firstThreeSlug)
-        slugCandidates.push(firstThreeSlug)
-      }
-    }
-
-    // Variante compactee pour les titres japonais
-    if (title.length >= 15) {
-      const parts = toSlug(title).split('-')
-      const compacted = parts.reduce((acc, word, i, arr) => {
-        if (word === '') return acc
-        if (word.length <= 3 && i < arr.length - 1) {
-          acc.push(word + arr[i + 1])
-          arr[i + 1] = ''
-        } else {
-          acc.push(word)
-        }
-        return acc
-      }, []).filter(Boolean).join('-')
-
-      if (compacted && compacted !== baseSlug && !seenSlugs.has(compacted)) {
-        seenSlugs.add(compacted)
-        slugCandidates.push(compacted)
-      }
-    }
-
-    // Variante sans article
-    const withoutArticle = baseSlug.replace(/^(the|a|an)-/i, '')
-    if (withoutArticle !== baseSlug && !seenSlugs.has(withoutArticle)) {
-      seenSlugs.add(withoutArticle)
-      slugCandidates.push(withoutArticle)
-    }
-
-    // Variante tronquee pour les slugs longs
-    const slugParts = baseSlug.split('-')
-    if (slugParts.length > 4) {
-      const truncated = slugParts.slice(0, 4).join('-')
-      if (!seenSlugs.has(truncated)) {
-        seenSlugs.add(truncated)
-        slugCandidates.push(truncated)
-      }
-      const strippedTrunc = truncated.replace(/^(the|a|an)-/i, '')
-      if (strippedTrunc !== truncated && !seenSlugs.has(strippedTrunc)) {
-        seenSlugs.add(strippedTrunc)
-        slugCandidates.push(strippedTrunc)
-      }
-    }
-  }
-
-  console.log(`[Streamzo] Generated ${slugCandidates.length} slug candidate(s)`)
-
-  // Limiter le nombre de slugs à tester pour éviter le timeout budget
-  const MAX_SLUGS = 6
-  const slugsToTry = slugCandidates.slice(0, MAX_SLUGS)
-
-  // Streamzo utilise le même pattern d'URL pour les films et les séries
-  // (directement à la racine: /slug, pas /series/slug)
-  for (const slug of slugsToTry) {
+  try {
+    const embedHtml = await fetchText(fullEmbedUrl, { timeout: TIMEOUTS.EMBED, retries: 0, signal })
     if (isAborted(signal) || isBudgetExhausted(startTime, PROVIDER_BUDGET_MS)) return null
 
-    // Streamzo place les films à la racine (/slug) et les séries sous /series/slug
-    // Pour les séries (mediaType=tv), on teste /series/ en premier
-    const pathsToTry = _mediaType === 'tv' ? [
-      `/series/${slug}`,    // Série (prioritaire pour TV)
-      `/${slug}`,           // Fallback film
-    ] : [
-      `/${slug}`,           // Film (prioritaire pour movie)
-      `/series/${slug}`,    // Fallback série
-    ]
+    const candidates = extractDirectUrls(embedHtml)
+    if (!candidates.length) {
+      console.log(`[Streamzo] Aucun flux dans l'embed ${fullEmbedUrl.slice(0, 80)}`)
+      return null
+    }
 
-    for (const path of pathsToTry) {
-      if (isAborted(signal)) return null
-
-      const pageUrl = `${SITE.BASE_URL}${path}`
+    for (const url of candidates) {
       try {
-        const html = await fetchText(pageUrl, { timeout: 4000, signal })
-        if (html && html.length > 5000) {
-          const embedUrl = extractEmbedUrl(html)
-          const hasEpisodes = hasSeriesEpisodes(html)
-          
-          if (embedUrl || hasEpisodes) {
-            const detectedType = hasEpisodes ? 'series' : 'movie'
-            // Pour les séries TV, ne pas retourner un film (slug homonyme)
-            // Continuer la recherche pour trouver la vraie série
-            if (detectedType === 'movie' && _mediaType === 'tv') {
-              console.log(`[Streamzo] Found movie at ${pageUrl} but looking for series, continuing...`)
-              continue
-            }
-            console.log(`[Streamzo] Found ${detectedType} page: ${pageUrl}`)
-            return {
-              type: detectedType,
-              url: pageUrl,
-              html,
-              embedUrl,
-              quality: extractQuality(html),
-            }
-          }
+        const resolved = await resolveStream(buildStream(url, quality, lang))
+        if (resolved && resolved.url && resolved.isDirect) {
+          return { ...buildStream(url, quality, lang), ...resolved }
         }
       } catch (e) {
         if (e.name === 'AbortError') return null
-        /* slug not found */
       }
     }
-  }
 
-  return null
-}
-
-/**
- * Resout l'URL embed en stream video
- */
-async function resolveEmbedToStream(embedUrl, quality, lang, signal) {
-  // Si l'embed est relatif, ajouter le base URL
-  if (isAborted(signal)) return null
-
-  let fullEmbedUrl = embedUrl
-  if (embedUrl.startsWith('/')) {
-    fullEmbedUrl = `${SITE.BASE_URL}${embedUrl}`
-  } else if (!embedUrl.startsWith('http')) {
-    fullEmbedUrl = `${SITE.BASE_URL}/${embedUrl}`
-  }
-
-  // Fetch la page embed pour trouver l'URL video directe
-  try {
-    const embedHtml = await fetchText(fullEmbedUrl, { timeout: TIMEOUTS.EMBED, signal })
-    if (isAborted(signal)) return null
-
-    const directUrl = extractDirectUrl(embedHtml)
-
-    if (directUrl) {
-      // Si c'est une URL relative, la completer
-      let videoUrl = directUrl
-      if (videoUrl.startsWith('//')) videoUrl = 'https:' + videoUrl
-      else if (videoUrl.startsWith('/')) videoUrl = `${SITE.BASE_URL}${videoUrl}`
-
-      const stream = {
-        name: `Streamzo (${lang})`,
-        title: `Streamzo - ${quality}`,
-        url: videoUrl,
-        quality,
-        headers: { Referer: `${SITE.BASE_URL}/`, Origin: SITE.BASE_URL },
-      }
-
-      // Resoudre le stream pour verifier s'il est direct
-      const resolved = await resolveStream(stream)
-      if (resolved && resolved.url && resolved.isDirect) {
-        return resolved
-      }
-      // Si la resolution echoue, retourner le stream brut
-      return stream
-    }
+    // Les manifests HLS tokenisés sont déjà directs : on renvoie le premier
+    // candidat même si le peeler a échoué sur un host inconnu.
+    return buildStream(candidates[0], quality, lang)
   } catch (e) {
     if (e.name === 'AbortError') return null
-    console.warn(`[Streamzo] Embed resolution failed: ${e.message}`)
+    console.warn(`[Streamzo] Résolution embed échouée: ${e.message}`)
+    return null
   }
-
-  return null
 }
 
-/**
- * Gere la detection de la langue depuis l'URL ou le contenu de la page
- * Streamzo est un site FR, on default en VF
- */
-function detectLanguage(url, html) {
-  const u = (url || '').toLowerCase()
-  const h = (html || '').toLowerCase()
-
-  if (u.includes('vostfr') || h.includes('vostfr')) return 'VOSTFR'
-  if (u.includes('-vf') || h.includes('version fran')) return 'VF'
-
-  // Streamzo est site FR → VF par defaut
-  return 'VF'
+/** Complète/écrase le label de langue depuis le slug (-vostfr) ou le data-lang. */
+function refineLangFromSlug(lang, href) {
+  if (href && /-vostfr(\/|$|\?)/i.test(href)) return 'VOSTFR'
+  return lang
 }
+
+// ─── Entrée ─────────────────────────────────────────────────────────────────
 
 /**
  * Extrait les streams d'un film/série sur streamzo.fr
@@ -348,56 +398,70 @@ function detectLanguage(url, html) {
  * @param {'movie'|'tv'} mediaType
  * @param {number|string} [season]
  * @param {number|string} [episode]
- * @param {object} [options] - Options optionnelles
- * @param {AbortSignal} [options.signal] - Signal d'annulation externe
+ * @param {object} [options]
+ * @param {AbortSignal} [options.signal]
  * @returns {Promise<Array>}
  */
-let _mediaType = null;
-
 export async function extractStreams(tmdbId, mediaType, season, episode, options = {}) {
   const signal = options?.signal || null
   if (isAborted(signal)) return []
   setCurrentSignal(signal)
 
+  const startTime = Date.now()
+  const wantSeries = mediaType === 'tv' || mediaType === 'series'
+
   const titles = await getTmdbTitles(tmdbId, mediaType, { season })
   if (!titles || titles.length === 0) return []
 
-  const startTime = Date.now()
-  _mediaType = mediaType
-  const content = await findContent(titles, mediaType, season, { signal, startTime })
-  if (!content) {
-    console.log(`[Streamzo] Content not found for TMDB ${tmdbId}`)
+  const year = titles._metadata?.year || ''
+
+  let match = await searchViaSuggest(titles, mediaType, year, signal, startTime)
+  if (!match) match = await searchViaSlugs(titles, mediaType, signal, startTime)
+  if (!match) {
+    console.log(`[Streamzo] Contenu introuvable pour TMDB ${tmdbId}`)
     return []
   }
 
-  const lang = detectLanguage(content.url, content.html)
-  console.log(`[Streamzo] Found ${content.type}: ${content.url}`)
+  if (isAborted(signal) || isBudgetExhausted(startTime, PROVIDER_BUDGET_MS)) return []
 
-  // Pour les films, utiliser l'embed directement
-  if (content.type === 'movie' || mediaType === 'movie') {
-    const stream = await resolveEmbedToStream(content.embedUrl, content.quality, lang, signal)
-    if (stream) {
-      console.log(`[Streamzo] Movie stream resolved: ${stream.quality || 'HD'}`)
-      return [stream]
-    }
-    console.log(`[Streamzo] Movie stream resolution failed`)
+  const pageUrl = `${SITE.BASE_URL}${match.href}`
+  const html = await fetchText(pageUrl, { timeout: TIMEOUTS.PAGE, retries: 1, signal })
+  if (!html || html.length < 1000) {
+    console.log(`[Streamzo] Page vide: ${pageUrl}`)
     return []
   }
 
-  // Pour les series, chercher l'episode correspondant dans les data-attributs
-  if (mediaType === 'tv') {
-    const episodeData = findSeriesEpisode(content.html, season, episode)
-    if (episodeData) {
-      if (isAborted(signal)) return []
-      console.log(`[Streamzo] Found S${season}E${episode} embed (${episodeData.lang}): ${episodeData.embedUrl}`)
-      const stream = await resolveEmbedToStream(episodeData.embedUrl, content.quality, episodeData.lang, signal)
-      if (stream) {
-        console.log(`[Streamzo] Series stream resolved: ${stream.quality || 'HD'}`)
-        return [stream]
-      }
+  console.log(`[Streamzo] Page ${match.kind}: ${pageUrl}`)
+
+  // ── Film : l'embed de la page suffit ──
+  if (match.kind === 'movie') {
+    const embedUrl = extractEmbedUrl(html)
+    if (!embedUrl) {
+      console.log(`[Streamzo] Aucun embed sur ${pageUrl}`)
+      return []
     }
-    console.log(`[Streamzo] Episode S${season}E${episode} not found on series page`)
+    const lang = refineLangFromSlug('VF', match.href)
+    const stream = await resolveEmbedToStream(embedUrl, match.quality, lang, signal, startTime)
+    return stream ? [stream] : []
   }
 
-  return []
+  // ── Série : chercher l'épisode (saison + numéro exacts, jamais d'approximation) ──
+  if (!wantSeries) return []
+
+  const variants = findSeriesEpisodes(html, season, episode)
+  if (!variants.length) {
+    console.log(`[Streamzo] Épisode S${season}E${episode} absent de ${pageUrl}`)
+    return []
+  }
+
+  const results = await Promise.allSettled(
+    variants.map(v => resolveEmbedToStream(v.embedUrl, match.quality, refineLangFromSlug(v.lang, match.href), signal, startTime))
+  )
+
+  const streams = []
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value) streams.push(r.value)
+  }
+  console.log(`[Streamzo] S${season}E${episode}: ${streams.length} flux (${variants.map(v => v.lang).join(', ')})`)
+  return streams
 }
