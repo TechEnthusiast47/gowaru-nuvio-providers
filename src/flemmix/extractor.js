@@ -1,6 +1,6 @@
 import { fetchText, fetchJson, setCurrentSignal } from './http.js'
 import cheerio from 'cheerio-without-node-native'
-import { resolveStream, safeFetch, isAborted } from '../utils/resolvers.js'
+import { resolveStream, safeFetch, withTimeout, isAborted } from '../utils/resolvers.js'
 import { getTmdbTitles } from '../utils/metadata.js'
 import { toStream, normalize, resolveTargetEpisodes, stripSeasonSuffix, countExtraWords } from '../utils/dle-extractor.js'
 import {
@@ -43,8 +43,6 @@ function scoreMatch(resultTitle, searchTitle) {
   if (words.length > 0) {
     // Anti-false-positive: si la recherche a ≥2 mots significatifs mais que
     // le résultat en partage < 2, c'est probablement une série différente
-    // Ex: "Law & Order" → mots=["law","order"] cherche "Police in a Pod" → matched=0 → reject
-    // Ex: "One Piece" → mots=["one","piece"] cherche "One Piece Saison 2" → matched=2 → OK
     if (words.length >= 2 && matched < 2) return 0
     return Math.round((matched / words.length) * 50)
   }
@@ -60,20 +58,48 @@ function bestMatch(items, title) {
   return bestScore >= SCORES.MIN_MATCH ? best : null
 }
 
-function parseServerTabs($, tabSelector, qualitySelector, langSelector) {
+/**
+ * Parse les onglets serveurs (film OU épisode). Priorité texte du bouton,
+ * fallback pills. Langue dérivée de l'URL vidsrc (ds_lang=fr) quand les
+ * deux sont absents.
+ */
+function parseServerTabs($, tabSelector) {
   const servers = []
   $(tabSelector).each((_, el) => {
     const $tab = $(el)
     const url = $tab.attr(SELECTORS.TAB_DATA_URL)
     if (!url) return
+    const absUrl = url.startsWith('http') ? url.replace(/&amp;/g, '&') : `${SITE.BASE_URL}${url}`.replace(/&amp;/g, '&')
 
     // TV-safe : .hasClass() n'existe pas dans le runtime cheerio de NuvioTV
     const isActive = ($tab.attr('class') || '').split(/\s+/).includes(SELECTORS.TAB_ACTIVE)
-    const quality = $tab.find(qualitySelector).first().text().trim() || 'HD'
-    const langRaw = $tab.find(langSelector).first().text().trim().toLowerCase()
-    const lang = LANGUAGE_MAP[langRaw] || 'VF'
+    const tabText = $tab.text().toLowerCase()
+    const langRaw = ($tab.find(SELECTORS.MOVIE_LANG_PILL).first().text() || '').trim().toLowerCase()
 
-    servers.push({ url, quality, language: lang, isActive })
+    let language
+    if (LANGUAGE_MAP[langRaw]) {
+      language = LANGUAGE_MAP[langRaw]
+    } else if (/vostfr/.test(tabText) && !/vo\b/.test(tabText.replace('vostfr', ''))) {
+      language = 'VOSTFR'
+    } else if (/(?:^|\s)vf(?:\s|$)|version fran/.test(tabText)) {
+      language = 'VF'
+    } else if (/vostfr/.test(tabText)) {
+      language = 'VOSTFR'
+    } else if (absUrl.includes('ds_lang=fr')) {
+      language = 'VF'
+    } else if (/french/.test(absUrl.toLowerCase())) {
+      language = 'VF'
+    } else {
+      language = 'VOSTFR'
+    }
+
+    const qualityText = ($tab.find(SELECTORS.MOVIE_QUALITY_PILL).first().text() || '').trim()
+    servers.push({
+      url: absUrl,
+      quality: qualityText ? qualityText.toUpperCase() : 'HD',
+      language,
+      isActive,
+    })
   })
   return servers
 }
@@ -81,11 +107,40 @@ function parseServerTabs($, tabSelector, qualitySelector, langSelector) {
 function parseSearchResults(json) {
   if (!Array.isArray(json)) return []
   return json.map(item => ({
-    url: `${SITE.BASE_URL}${item.url}`,
+    url: `${SITE.BASE_URL}${item.url}`.replace(/&amp;/g, '&'),
     title: item.title,
     isSeries: item.type === 'tvshow',
     year: item.year,
   }))
+}
+
+/**
+ * Recherche par langue sur l'endpoint /search : le site renvoie des résultats
+ * distincts selon q=FR ou q=EN (ex: "Spartacus" vide, "Spartacus VOSTFR" →
+ * la série). On sonde chaque titre dans les deux langues.
+ */
+async function trySearchBilingual(titles, filterSeries) {
+  for (const title of titles.slice(0, MAX_SEARCH_TITLES)) {
+    const probes = [
+      `${ENDPOINTS.SEARCH}${encodeURIComponent(title)}`,
+      `${ENDPOINTS.SEARCH}${encodeURIComponent(`${title} VOSTFR`)}`,
+    ]
+    const settled = await Promise.allSettled(probes.map(p => fetchJson(p, { timeout: TIMEOUTS.SEARCH })))
+    for (const r of settled) {
+      if (r.status !== 'fulfilled') continue
+      const results = parseSearchResults(r.value)
+      if (results.length === 0) continue
+
+      const filtered = filterSeries
+        ? results.filter(x => x.isSeries)
+        : results.filter(x => !x.isSeries)
+
+      const candidates = filtered.length > 0 ? filtered : results
+      const match = bestMatch(candidates, title)
+      if (match) return match
+    }
+  }
+  return null
 }
 
 function parseSeasons(html) {
@@ -98,7 +153,7 @@ function parseSeasons(html) {
     if (m) {
       seasons.push({
         num: parseInt(m[1]),
-        link: `${SITE.BASE_URL}${href}`,
+        link: `${SITE.BASE_URL}${href}`.replace(/&amp;/g, '&'),
         title: $card.find(SELECTORS.SERIES_SEASON_TITLE).first().text().trim() || $card.text().trim(),
       })
     }
@@ -115,9 +170,10 @@ function parseSeasonEpisodes(html) {
     const m = href.match(PATTERNS.EPISODE_LINK)
     if (m) {
       episodes.push({
-        season: parseInt(m[1]),
-        episode: parseInt(m[2]),
-        link: `${SITE.BASE_URL}${href}`,
+        // Le slug de l'épisode est sans suffixe id : /{slug}/{s}x{e}
+        season: parseInt(m[2]),
+        episode: parseInt(m[3]),
+        link: `${SITE.BASE_URL}${href}`.replace(/&amp;/g, '&'),
         title: $card.find(SELECTORS.SERIES_EPISODE_TITLE).first().text().trim(),
       })
     }
@@ -147,7 +203,7 @@ async function detectSubType(tmdbId, mediaType, titles) {
     const genres = (details.genres || []).map(g => g.id)
     const isAnim = genres.includes(ANIME_GENRE_ID)
     const orig = mediaType === 'movie' ? details.original_title : details.original_name
-    const jap = /[\u3000-\u9FFF\uF900-\uFAFF]/.test(orig || '')
+    const jap = isJapanese(orig || '')
     const keywordMatch = titles.some(t => ANIME_KEYWORDS.test(t))
     if (isAnim && (jap || keywordMatch)) return 'anime'
     return null
@@ -156,31 +212,44 @@ async function detectSubType(tmdbId, mediaType, titles) {
   }
 }
 
-async function trySearch(titles, filterSeries) {
-  for (const title of titles.slice(0, MAX_SEARCH_TITLES)) {
-    try {
-      const url = `${ENDPOINTS.SEARCH}${encodeURIComponent(title)}`
-      const json = await fetchJson(url, { timeout: TIMEOUTS.SEARCH })
-      const results = parseSearchResults(json)
-      if (results.length === 0) continue
-
-      const filtered = filterSeries
-        ? results.filter(r => r.isSeries)
-        : results.filter(r => !r.isSeries)
-
-      const candidates = filtered.length > 0 ? filtered : results
-      const match = bestMatch(candidates, title)
-      if (match) return match
-    } catch (e) {
-      console.warn(`[Flemmix] Search failed for "${title}": ${e.message}`)
+/**
+ * Fallback sitemap : les sitemaps publics listent TOUTES les fiches du site
+ * (652 films / 293 séries vérifiés) même quand la recherche JSON échoue.
+ * Requête une seule fois par session (cache 30 min).
+ */
+async function trySitemap(titles, filterSeries) {
+  try {
+    const sitemapUrl = filterSeries ? ENDPOINTS.SITEMAP_TVSHOWS : ENDPOINTS.SITEMAP_MOVIES
+    const xml = await withCache(`sm_${filterSeries ? 'tv' : 'mv'}`, () => fetchText(sitemapUrl, { timeout: TIMEOUTS.SEARCH }), { successTtl: 1800000, failureTtl: 60000 })
+    if (!xml) return null
+    const items = []
+    const re = /<loc>\s*([^<]+?)\s*<\/loc>/g
+    let m
+    while ((m = re.exec(xml)) !== null) {
+      const loc = m[1]
+      const parts = loc.replace(/\/$/, '').split('/')
+      const slug = parts[parts.length - 1] || ''
+      if (!slug) continue
+      items.push({
+        url: loc,
+        title: slug.replace(/-\d{2,}$/, '').replace(/-vf$|-vostfr$/i, '').replace(/-/g, ' '),
+        isSeries: filterSeries,
+      })
     }
+    if (items.length === 0) return null
+    for (const title of titles.slice(0, MAX_SEARCH_TITLES)) {
+      const match = bestMatch(items, title)
+      if (match) return match
+    }
+  } catch (e) {
+    console.warn(`[Flemmix] Sitemap fallback failed: ${e.message}`)
   }
   return null
 }
 
-async function resolveWithTimeout(stream) {
+async function resolveWithTimeout(stream, timeoutMs = 14000) {
   try {
-    const resolved = await resolveStream(stream)
+    const resolved = await withTimeout(resolveStream(stream), timeoutMs)
     if (resolved && resolved.url && resolved.isDirect) return resolved
     return null
   } catch {
@@ -188,18 +257,30 @@ async function resolveWithTimeout(stream) {
   }
 }
 
+/**
+ * Résout les serveurs. Sources réelles du site :
+ *  - embeds signés flemmix (peel → minochinos → player packé → master.m3u8)
+ *  - vidsrc-embed.ru (VO/VOSTFR) : chaîne /vs_src.php → cloud gate fermée
+ *    (403 "Session expired", token host-bound non reproductible hors
+ *    navigateur — vérifié en live) → embed NON retourné (non jouable par
+ *    ExoPlayer, convention repo : ne jamais retourner d'embed irrésolu).
+ */
 async function createStreamsFromServers(servers, name, subType) {
   const results = await Promise.allSettled(
     servers.map(async (server) => {
       const stream = toStream(server.url, server.language || 'VF', name, SITE.BASE_URL, { quality: server.quality || 'HD', subType })
+      // Referer flemmix sur l'embed signé (hotlink check)
+      if (/flemmix\.me\/embed\//.test(server.url)) {
+        stream.headers = { ...stream.headers, Referer: `${SITE.BASE_URL}/`, Origin: SITE.BASE_URL }
+      }
       const resolved = await resolveWithTimeout(stream)
-      if (resolved && resolved.url) {
+      if (resolved && resolved.url && resolved.isDirect) {
         return { ...resolved, provider: 'flemmix' }
       }
-      return { ...stream, provider: 'flemmix' }
+      return null
     })
   )
-  return results.filter(r => r.status === 'fulfilled').map(r => r.value).filter(s => s && s.isDirect)
+  return results.filter(r => r.status === 'fulfilled').map(r => r.value).filter(Boolean)
 }
 
 export async function extractStreams(tmdbId, mediaType, season, episode, options = {}) {
@@ -207,10 +288,12 @@ export async function extractStreams(tmdbId, mediaType, season, episode, options
   if (isAborted(signal)) return []
   setCurrentSignal(signal)
 
+  // ⚠️ Nuvio passe 'series' (jamais 'tv') — resolveTargetEpisodes exige 'tv'.
+  const isTv = mediaType === 'series' || mediaType === 'tv'
+
   const rawTitles = await getTmdbTitles(tmdbId, mediaType, { season })
   if (!rawTitles || rawTitles.length === 0) return []
-  // Strip season suffixes (ex: "Naruto Season 1" → "Naruto") pour éviter les
-  // variantes diluées dans la recherche — préserve les métadonnées attachées
+  // Strip season suffixes (ex: "Naruto Season 1" → "Naruto")
   const titles = rawTitles.map(t => stripSeasonSuffix(t))
   titles._metadata = rawTitles._metadata
   titles.effectiveSeason = rawTitles.effectiveSeason
@@ -220,50 +303,15 @@ export async function extractStreams(tmdbId, mediaType, season, episode, options
 
   if (isAborted(signal)) return []
 
-  if (mediaType === 'movie') {
+  if (!isTv) {
     return extractMovie(tmdbId, titles, subType)
   }
 
   return extractSeries(tmdbId, mediaType, titles, season, episode, subType)
 }
 
-async function browseCategory(mediaType, titles) {
-  const baseType = mediaType === 'movie' ? 'films' : 'series'
-  const linkPattern = mediaType === 'movie' ? '/film/' : '/serie/'
-  const url = `${SITE.BASE_URL}/${baseType}`
-
-  try {
-    const html = await fetchText(url, { timeout: TIMEOUTS.PAGE })
-    const $ = cheerio.load(html)
-    const items = []
-
-    $(`a[href*="${linkPattern}"]`).each((i, el) => {
-      const href = $(el).attr('href') || ''
-      const title = $(el).text().trim() || $(el).find('img').first().attr('alt') || ''
-      if (href && title) {
-        items.push({
-          url: href.startsWith('http') ? href : `${SITE.BASE_URL}${href}`,
-          title,
-        })
-      }
-    })
-
-    if (items.length === 0) return null
-    console.log(`[Flemmix] Browsing ${baseType}: ${items.length} items`)
-
-    for (const title of titles.slice(0, MAX_SEARCH_TITLES)) {
-      const match = bestMatch(items, title)
-      if (match) return match
-    }
-    return null
-  } catch (e) {
-    console.warn(`[Flemmix] Category browse failed: ${e.message}`)
-    return null
-  }
-}
-
 async function extractMovie(tmdbId, titles, subType) {
-  const match = await trySearch(titles, false) || await browseCategory('movie', titles)
+  const match = await trySearchBilingual(titles, false) || await trySitemap(titles, false)
   if (!match) {
     console.warn(`[Flemmix] Movie not found for TMDB ${tmdbId}`)
     return []
@@ -273,17 +321,13 @@ async function extractMovie(tmdbId, titles, subType) {
   try {
     const pageHtml = await fetchText(match.url, { timeout: TIMEOUTS.PAGE })
     const $ = cheerio.load(pageHtml)
-    const servers = parseServerTabs(
-      $,
-      SELECTORS.MOVIE_PLAYER_TABS,
-      SELECTORS.MOVIE_QUALITY_PILL,
-      SELECTORS.MOVIE_LANG_PILL
-    )
+    const servers = parseServerTabs($, SELECTORS.MOVIE_PLAYER_TABS)
 
     if (servers.length === 0) {
       console.warn(`[Flemmix] No servers on ${match.url}`)
       return []
     }
+    console.log(`[Flemmix] Movie: ${servers.length} serveur(s) [${servers.map(s => s.language).join(', ')}]`)
 
     return await createStreamsFromServers(servers, 'Flemmix', subType)
   } catch (e) {
@@ -295,9 +339,10 @@ async function extractMovie(tmdbId, titles, subType) {
 async function extractSeries(tmdbId, mediaType, titles, season, episode, subType) {
   const effectiveSeason = titles.effectiveSeason != null ? titles.effectiveSeason : season
   const targetSeasonNum = parseInt(effectiveSeason) || 1
-  const targetEpisodeNums = await resolveTargetEpisodes(tmdbId, mediaType, season, episode)
+  // resolveTargetEpisodes exige mediaType === 'tv' → normaliser
+  const targetEpisodeNums = await resolveTargetEpisodes(tmdbId, 'tv', season, episode)
 
-  const match = await trySearch(titles, true) || await browseCategory('tv', titles)
+  const match = await trySearchBilingual(titles, true) || await trySitemap(titles, true)
   if (!match) {
     console.warn(`[Flemmix] Series not found for TMDB ${tmdbId}`)
     return []
@@ -312,7 +357,14 @@ async function extractSeries(tmdbId, mediaType, titles, season, episode, subType
       return []
     }
 
-    const targetSeason = seasons.find(s => s.num === targetSeasonNum) || seasons[0]
+    // ⚠️ Anti-mismatch : si la saison demandée n'existe pas sur le site, ne
+    // JAMAIS retomber sur une autre saison (l'utilisateur recevrait des
+    // épisodes qui ne correspondent pas au titre). On abandonne proprement.
+    const targetSeason = seasons.find(s => s.num === targetSeasonNum)
+    if (!targetSeason) {
+      console.warn(`[Flemmix] Season ${targetSeasonNum} not found on site (available: ${seasons.map(s => s.num).join(', ')})`)
+      return []
+    }
     console.log(`[Flemmix] Selected season: ${targetSeason.num} -> ${targetSeason.link}`)
 
     const seasonHtml = await fetchText(targetSeason.link, { timeout: TIMEOUTS.PAGE })
@@ -324,30 +376,26 @@ async function extractSeries(tmdbId, mediaType, titles, season, episode, subType
 
     let ep = null
     for (const epNum of targetEpisodeNums) {
-      ep = episodes.find(e => e.episode === epNum)
+      ep = episodes.find(e => e.season === targetSeasonNum && e.episode === epNum)
       if (ep) break
     }
-    if (!ep) ep = episodes[targetEpisodeNums[0] - 1]
-
+    // ⚠️ PAS de fallback par index (l'ancien `episodes[epNum-1]` donnait
+    // l'épisode suivant/précédent quand un numéro manquait = mismatch).
     if (!ep) {
-      console.warn(`[Flemmix] Episode ${targetEpisodeNums[0]} not found in season ${targetSeasonNum}`)
+      console.warn(`[Flemmix] Episode ${targetEpisodeNums[0]} not found in season ${targetSeasonNum} (${episodes.length} episodes available)`)
       return []
     }
 
     console.log(`[Flemmix] Episode: S${ep.season}E${ep.episode} -> ${ep.link}`)
     const epHtml = await fetchText(ep.link, { timeout: TIMEOUTS.PAGE })
     const $ = cheerio.load(epHtml)
-    const servers = parseServerTabs(
-      $,
-      SELECTORS.EPISODE_PLAYER_TABS,
-      SELECTORS.EPISODE_QUALITY_PILL,
-      SELECTORS.EPISODE_LANG_PILL
-    )
+    const servers = parseServerTabs($, SELECTORS.EPISODE_PLAYER_TABS)
 
     if (servers.length === 0) {
       console.warn(`[Flemmix] No servers on episode page`)
       return []
     }
+    console.log(`[Flemmix] Episode: ${servers.length} serveur(s) [${servers.map(s => s.language).join(', ')}]`)
 
     return await createStreamsFromServers(servers, 'Flemmix', subType)
   } catch (e) {
@@ -355,4 +403,3 @@ async function extractSeries(tmdbId, mediaType, titles, season, episode, subType
   }
   return []
 }
-

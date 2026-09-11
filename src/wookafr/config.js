@@ -1,13 +1,15 @@
 export const SITE = {
-  BASE_URL: 'https://wookafr.center',
-  DOMAINS: ['https://wookafr.center', 'https://wookafr.cymru', 'https://wookafr.fyi', 'https://wookafr.bond', 'https://wookafr.blue'],
-  DOMAIN: 'wookafr.center',
+  // Domaine actuel vérifié en live (2026-09) : les anciens domaines
+  // redirigent tous en 301 vers boston (et certains en boucle circulaire).
+  BASE_URL: 'https://wookafr.boston',
+  DOMAINS: ['https://wookafr.boston', 'https://wookafr.center'],
+  DOMAIN: 'wookafr.boston',
 }
 
 export const ENDPOINTS = {
   SEARCH: `${SITE.BASE_URL}/?s=`,
   AJAX: `${SITE.BASE_URL}/wp-admin/admin-ajax.php`,
-  WP_API: `/wp-json/v2/posts`,
+  WP_API: '/wp-json/wp/v2/posts',
 }
 
 export const SELECTORS = {
@@ -57,6 +59,35 @@ export const LANGUAGE_MAP = {
   vfq: 'VF',
   vost: 'VOSTFR',
 }
+
+/**
+ * Sections de langue de l'embed lecteurvideo.com → tag langue normalisé.
+ * L'embed classe ses serveurs dans des div class="OD OD_XX" :
+ *   OD_FR (Sélection FR) / OD_VFF (VF original) / OD_VFQ (Québec) /
+ *   OD_VOSTFR (VOSTFR) / OD_EN (VO) / OD_down (onglet Télécharger)
+ * Vérifié en live : Arcane S01E01 → sections OD_FR + OD_down.
+ */
+export const LECTEURVIDEO_LANG_SECTIONS = {
+  FR: 'VF',
+  VFF: 'VFF',
+  VFQ: 'VFQ',
+  VFI: 'VF',
+  VOSTFR: 'VOSTFR',
+  VOST: 'VOSTFR',
+  EN: 'VO',
+  VO: 'VO',
+}
+
+/**
+ * Hébergeurs connus acceptés depuis les sections de langue de l'embed.
+ * Ces URLs (embeds uqload/vidmoly/veev/…) sont ensuite résolues en flux
+ * directs par resolveStream (résolveurs spécifiques déjà présents).
+ */
+export const LECTEURVIDEO_KNOWN_HOSTS = [
+  'uqload.', 'vidmoly.', 'veev.', 'waaw.to', 'voe.', 'filemoon',
+  'emmmmbed.com', 'wishonly.site', 'coflix.', 'oneupload.', 'vidoza.',
+  'sendvid.', 'sibnet.ru', 'myvi.', 'luluvid.', 'upn.one',
+]
 
 export const ANIME_GENRE_ID = 16
 

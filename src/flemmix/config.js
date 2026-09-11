@@ -5,6 +5,10 @@ export const SITE = {
 
 export const ENDPOINTS = {
   SEARCH: `${SITE.BASE_URL}/search?q=`,
+  // Sitemaps publics mis à jour quotidiennement (fallback si la recherche échoue)
+  SITEMAP_INDEX: `${SITE.BASE_URL}/sitemap.xml`,
+  SITEMAP_MOVIES: `${SITE.BASE_URL}/sitemap-movies-1.xml`,
+  SITEMAP_TVSHOWS: `${SITE.BASE_URL}/sitemap-tvshows-1.xml`,
 }
 
 export const SELECTORS = {
@@ -29,7 +33,7 @@ export const SELECTORS = {
 
   EPISODE_PLAYER_TABS: 'button.episode-server-tab',
   EPISODE_PLAYER_MOUNT: '#episode-player-mount',
-  EPISODE_PLAYER_CONTAINER: '#episode-player-container',
+  EPISODE_PLAYER_CONTAINER: '#player-container',
   EPISODE_QUALITY_PILL: '.quality-pill',
   EPISODE_LANG_PILL: '.lang-pill',
 
@@ -40,8 +44,10 @@ export const SELECTORS = {
 }
 
 export const PATTERNS = {
-  SEASON_LINK: /\/saison-(\d+)$/i,
-  EPISODE_LINK: /\/(\d+)x(\d+)$/i,
+  // Pages saison : /{slug}-{id}/saison-{n} (ex: /house-of-the-dragon-04/saison-2)
+  SEASON_LINK: /\/saison-(\d+)(?:-vf|-vostfr)?$/i,
+  // Pages épisode : /{slug}/{s}x{e} (ex: /house-of-the-dragon/3x2) — slug SANS suffixe id
+  EPISODE_LINK: /\/([a-z0-9-]+)\/(\d+)x(\d+)$/i,
   IMDB_ID: /tt(\d+)/,
   TMDB_IMAGE: /image\.tmdb\.org\/t\/p\/[^/]+\/([a-zA-Z0-9]+)\.jpg/,
 }

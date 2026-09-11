@@ -1166,8 +1166,20 @@ export async function safeFetch(url, options = {}) {
     const SLOW_THRESHOLD = 15000;
 
     // Cache lookup pour les requêtes GET (élimine les doublons TMDB/ArmSync)
+    // ⚠️ La clé DOIT inclure les headers explicites : certains CDN (uqload,
+    // lecteurvideo…) filtrent par whitelist de Referer — la même URL peut
+    // renvoyer une page différente (stub "restricted" vs joueur complet)
+    // selon le Referer. Sans cela, un stub mis en cache empoisonne toutes
+    // les tentatives suivantes avec d'autres headers.
     const method = (options.method || 'GET').toUpperCase();
-    const cacheKey = method + '|' + url;
+    let headerTag = '';
+    if (options.headers && typeof options.headers === 'object') {
+        const keys = Object.keys(options.headers).sort();
+        if (keys.length) {
+            headerTag = '|' + keys.map(k => `${k.toLowerCase()}=${String(options.headers[k]).slice(0, 80)}`).join('&');
+        }
+    }
+    const cacheKey = method + '|' + url + headerTag;
     if (method === 'GET') {
         const cached = getCachedFetch(cacheKey);
         if (cached) {
@@ -1557,6 +1569,7 @@ export async function resolveUqload(url) {
     const fallbackDomains = [originalDomain];
     if (originalDomain.endsWith('.bz')) fallbackDomains.push('uqload.co', 'uqload.to');
     if (originalDomain.endsWith('.to')) fallbackDomains.push('uqload.co');
+    if (originalDomain.endsWith('.cx')) fallbackDomains.push('uqload.co', 'uqload.vc');
     const uniqueDomains = [...new Set(fallbackDomains)];
 
     // Marqueurs de fichier expiré/supprimé servis par uqload (vérifié en live sur
@@ -1575,44 +1588,55 @@ export async function resolveUqload(url) {
         return EXPIRED_MARKERS.some(m => low.includes(m));
     };
 
-    return new Promise((resolve) => {
-        let failures = 0;
-        let resolved = false;
+    // ⚠️ uqload filtre les embeds par WHITELIST de Referer (vérifié en live 2026-09) :
+    //  - Referer auto (= domaine uqload) → 38 octets "Video embed restricted for this domain"
+    //  - Referer https://lecteurvideo.com/ (parent réel des embeds wookafr) → page joueur complète
+    //  - Sans Referer → page joueur complète (cas générique)
+    // On essaie dans cet ordre ; le stub "restricted" (~40 octets) est détecté
+    // immédiatement pour ne pas dépacker inutilement.
+    const isRestrictedStub = (html) => html.length < 200 && /restricted for this domain/i.test(html);
+    const refererChain = [
+        `https://${uniqueDomains[0]}/`,   // self (comportement historique, autres providers)
+        'https://lecteurvideo.com/',      // parent lecteurvideo (chaîne wookafr)
+        '',                                // sans Referer
+    ];
 
-        const checkDomain = async (domain) => {
+    // ⚠️ Regexes tolérantes aux query strings : l'URL servie est
+    // "https://strm8.uqload.vc/hls2/.../master.m3u8?t=...&s=..." — l'extension
+    // n'est PAS en fin de chaîne (les anciennes regexes ratent donc le flux).
+    const extractFile = (content) =>
+        content.match(/file\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/i) ||
+        content.match(/sources\s*:\s*\[[^\]]*?\{[^}]*?file\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/i) ||
+        content.match(/sources\s*:\s*\[["']([^"']+\.(?:mp4|m3u8)[^"']*)["']\]/i) ||
+        content.match(/["'](https?:\/\/[^"']*\/hls\d?\/[^"']*\.m3u8[^"']*)["']/i) ||
+        content.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)["']/i);
+
+    for (const domain of uniqueDomains) {
+        const tryUrl = `https://${domain}${normalizedPath}`;
+        for (const referer of refererChain) {
             try {
-                const tryUrl = `https://${domain}${normalizedPath}`;
-                const ref = `https://${domain}/`;
-                const res = await safeFetch(tryUrl, { headers: { ...HEADERS, 'Referer': ref } });
-                if (res) {
-                    const html = await res.text();
-                    if (isExpiredPage(html) && !resolved) {
-                        resolved = true;
-                        console.warn(`[Resolver] uqload embed dead (expired/deleted): ${url.slice(0, 80)}`);
-                        resolve({ url, isDead: true });
-                        return;
-                    }
-                    let content = html;
-                    if (content.includes('p,a,c,k,e,d') || content.includes('eval(function')) content = unpack(content);
-                    const match = content.match(/sources\s*:\s*\[[^\]]*?\{[^}]*?file\s*:\s*["']([^"']+\.(?:mp4|m3u8))["']/i) ||
-                                  content.match(/sources\s*:\s*\[["']([^"']+\.(?:mp4|m3u8))["']\]/i) ||
-                                  content.match(/file\s*:\s*["']([^"']+\.(?:mp4|m3u8))["']/i);
-                    if (match && !resolved) {
-                        resolved = true;
-                        resolve({ url: match[1], headers: { "Referer": ref } });
-                        return;
-                    }
+                const headers = { ...HEADERS };
+                if (referer) headers['Referer'] = referer;
+                const res = await safeFetch(tryUrl, { headers });
+                if (!res) continue;
+                let html = await res.text();
+                if (isExpiredPage(html)) {
+                    console.warn(`[Resolver] uqload embed dead (expired/deleted): ${url.slice(0, 80)}`);
+                    return { url, isDead: true };
+                }
+                if (isRestrictedStub(html) || (!html.includes('p,a,c,k,e,d') && !html.includes('eval(function') && !extractFile(html))) continue;
+                if (html.includes('p,a,c,k,e,d') || html.includes('eval(function')) html = unpack(html);
+                const match = extractFile(html);
+                if (match) {
+                    const playHeaders = { "Referer": `https://${domain}/` };
+                    return { url: match[1], headers: playHeaders };
                 }
             } catch (e) {}
-            
-            failures++;
-            if (failures === uniqueDomains.length && !resolved) {
-                resolve({ url });
-            }
-        };
-
-        uniqueDomains.forEach(checkDomain);
-    });
+        }
+    }
+    // Tous les domaines/referers épuisés sans fichier trouvé → retourner
+    // l'embed tel quel (le generic fallback de resolveStream peut le traiter)
+    return { url };
 }
 
 export async function resolveVoe(url) {
@@ -2435,7 +2459,10 @@ export async function resolveStream(stream, depth = 0) {
             // Si un résolveur spécifique a déjà traité cette URL (depth 0) et a échoué,
             // on saute la recherche de direct URL (déjà faite par le résolveur) et on va
             // directement à la détection d'iframe. Évite un safeFetch + unpack + 6 regex.
-            const skipDirectScan = (result && result.url === originalUrl && depth === 0);
+            // ⚠️ let (et non const) : à depth > 0, après un peeling raté, on RÉACTIVE
+            // le scan regex — le player final est souvent packé et contient le flux
+            // direct (ex: minochinos → master.m3u8) que l'ancien code abandonnait ici.
+            let skipDirectScan = (result && result.url === originalUrl && depth === 0);
 
             const res = await safeFetch(originalUrl, { headers: stream.headers });
             if (res) {
@@ -2470,7 +2497,12 @@ export async function resolveStream(stream, depth = 0) {
                     // on retourne le résultat. Si depth>1 et isDirect: false, on continue
                     // vers les regex comme fallback.
                     if (peeledResult && peeledResult.isDirect) return peeledResult;
-                    if (depth > 0) return peeledResult;
+                    if (depth > 0) {
+                        // Peeling raté à depth > 0 → ne pas abandonner : scanner
+                        // quand même les regex sur la page courante (player packé
+                        // contenant le master.m3u8 direct, ex: minochinos).
+                        skipDirectScan = false;
+                    }
                     // depth=0 et peeling a échoué → continuer vers les regex
                 }
 
